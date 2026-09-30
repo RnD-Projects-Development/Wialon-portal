@@ -1,0 +1,34 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# --- Local operational data ---
+# SQLite fallback DB: contains real fleet/driver records
+compliance.db
+# Live caches + ~119 regenerable API dumps. The offline fallback snapshot
+# (02_search_all_units_full_data.json) is rebuilt by wialon_explorer.py.
+wialon_output/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Tooling / editors / OS ---
+.claude/settings.local.json
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Generated artifacts ---
+alert_preview.html
+*.xlsx

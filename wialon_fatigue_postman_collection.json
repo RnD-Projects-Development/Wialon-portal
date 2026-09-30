@@ -1,0 +1,179 @@
+{
+  "info": {
+    "name": "Wialon - Fatigue Driving data check",
+    "description": "The exact Wialon Remote API calls the portal makes to calculate Fatigue Driving, in order.\n\nSetup: open the collection Variables tab and paste your token into `token` (it is WIALON_TOKEN in the project .env). Then run the requests top to bottom: login stores `sid` automatically, and the search stores `unit_id` for the plate in `plate`.\n\nDefault window is the CCH-949 violation of 2026-09-17 19:43:44 PKT (16:13 - 20:13 PKT). Times are unix seconds, UTC based; PKT is UTC+5.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://hst-api.wialon.eu", "type": "string" },
+    { "key": "token", "value": "", "type": "string" },
+    { "key": "sid", "value": "", "type": "string" },
+    { "key": "plate", "value": "CCH-949", "type": "string" },
+    { "key": "unit_id", "value": "601733297", "type": "string" },
+    { "key": "time_from", "value": "1789643580", "type": "string" },
+    { "key": "time_to", "value": "1789657980", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "1. Login (token/login)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const body = pm.response.json();",
+              "if (body.eid) { pm.collectionVariables.set('sid', body.eid); }",
+              "pm.test('logged in', () => pm.expect(body.eid, JSON.stringify(body)).to.be.a('string'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "token/login", "type": "text" },
+            { "key": "params", "value": "{\"token\":\"{{token}}\"}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "Returns eid (the session id). Every later call sends it as sid. Sessions expire after a few minutes of inactivity: run this again if a call returns {\"error\":1}."
+      }
+    },
+    {
+      "name": "2. Find the vehicle (core/search_items)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const body = pm.response.json();",
+              "const item = (body.items || [])[0];",
+              "if (item) { pm.collectionVariables.set('unit_id', String(item.id)); }",
+              "pm.test('found the vehicle', () => pm.expect(item, JSON.stringify(body)).to.be.an('object'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "core/search_items", "type": "text" },
+            { "key": "params", "value": "{\"spec\":{\"itemsType\":\"avl_unit\",\"propName\":\"sys_name\",\"propValueMask\":\"{{plate}}\",\"sortType\":\"sys_name\"},\"force\":1,\"flags\":1,\"from\":0,\"to\":0}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "items[0].id is the unit id used by every telemetry call. Stored into unit_id."
+      }
+    },
+    {
+      "name": "3. Load the window (messages/load_interval)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "messages/load_interval", "type": "text" },
+            { "key": "params", "value": "{\"itemId\":{{unit_id}},\"timeFrom\":{{time_from}},\"timeTo\":{{time_to}},\"flags\":1,\"flagsMask\":65281,\"loadCount\":0}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "Loads data messages that carry a position into the session and returns {\"count\": N}. flags 1 with mask 65281 (0xFF01) means: data messages, with position. loadCount 0 returns the count only; the next call fetches the messages."
+      }
+    },
+    {
+      "name": "4. Read the messages the engine reads (messages/get_messages)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "messages/get_messages", "type": "text" },
+            { "key": "params", "value": "{\"indexFrom\":0,\"indexTo\":4294967295,\"filter\":\"pos.s,pos.x,pos.y,p.io_239,p.io_16\"}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "Every message in the window, cut down to the fields the fatigue rule uses:\n  t          message time, unix seconds (add 5 h for PKT)\n  pos.s      speed in km/h        -> driving needs 5 or more\n  p.io_239   ignition, 1 or 0     -> driving needs 1\n  pos.y/x    latitude / longitude -> where the violation is placed\n  p.io_16    odometer in metres   -> the odometer shown per violation\n\nRest is the opposite: ignition 0, or speed under 5. A stop of 5 minutes or more resets the driving timer; reaching 2:30 of driving (2:00 between 22:00 and 06:00 PKT) without a 15-minute break is the violation.\n\nRemove the filter line to see every field Wialon sends for each message."
+      }
+    },
+    {
+      "name": "5. Free the session (messages/unload)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "messages/unload", "type": "text" },
+            { "key": "params", "value": "{}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "One session holds one loaded message set, so unload before loading another vehicle or window."
+      }
+    },
+    {
+      "name": "6. The six Wialon alerts (messages/load_interval, violations)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "messages/load_interval", "type": "text" },
+            { "key": "params", "value": "{\"itemId\":{{unit_id}},\"timeFrom\":{{time_from}},\"timeTo\":{{time_to}},\"flags\":1537,\"flagsMask\":65281,\"loadCount\":4294967295}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "flags 1537 (0x0601) with mask 65281 means: event messages that are marked as violations. These are Overspeed, Overspeed-Highway, Overspeed-Motorway, Night Driving, Seat Belt and Delay Driver Seat Belt, recorded by Wialon itself. The portal reads them as they are and calculates nothing.\n\nEach message has:\n  t            when the condition happened\n  et           Wialon's text, with speed and address\n  p.evt_name   which notification fired (this is how the portal names the type)\n  x / y        longitude / latitude"
+      }
+    },
+    {
+      "name": "7. Trip detector settings (unit/get_trip_detector)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "unit/get_trip_detector", "type": "text" },
+            { "key": "params", "value": "{\"itemId\":{{unit_id}}}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] },
+        "description": "minStayTime is 300 on this fleet: Wialon splits trips at stops of 5 minutes, the same as the portal's reset stop. That is why the trips shortlist cannot miss a vehicle that breaks the limit."
+      }
+    },
+    {
+      "name": "8. Logout (core/logout)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "svc", "value": "core/logout", "type": "text" },
+            { "key": "params", "value": "{}", "type": "text" },
+            { "key": "sid", "value": "{{sid}}", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/wialon/ajax.html", "host": ["{{base_url}}"], "path": ["wialon", "ajax.html"] }
+      }
+    }
+  ]
+}

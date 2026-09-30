@@ -1,0 +1,14 @@
+{
+  "max_continuous_drive_day": "02:30",
+  "max_continuous_drive_night": "02:30",
+  "min_break_day": "00:15",
+  "min_break_night": "00:15",
+  "min_reset_stop": "00:05",
+  "max_drive_24h": "10:30",
+  "min_rest_24h": "08:00",
+  "max_onduty_24h": "12:00",
+  "harsh_braking_penalty": 1,
+  "harsh_accel_penalty": 1,
+  "overspeed_penalty": 1,
+  "hos_penalty": 1
+}
