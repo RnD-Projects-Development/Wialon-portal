@@ -40,6 +40,14 @@ TELEMETRY_FILTER = "pos.s,pos.x,pos.y,p.io_239,p.io_16"
 TELEMETRY_MATCH_SEC = 10 * 60   # telemetry shown for a violation must be at most this much older
 CACHE_VERSION = 2               # bump when the cached message row layout changes
 
+# Inspecting one violation reads the span it was raised on, padded either side. Fatigue Driving fires at
+# the end of a continuous drive run, so its span is the run itself; a notification alert is one instant.
+# The portal's telemetryWindow() in app.py applies the same pad client-side.
+TELEMETRY_PAD_SEC = 5 * 60
+# Read (and analyse) this much before the displayed window: fatigue_engine accumulates dwell and rest as
+# it walks the stream, so starting cold at the window edge would show those counters reset to zero.
+TELEMETRY_LEAD_SEC = 30 * 60
+
 # Display order matches the portal's violation chart. Descriptions of the Wialon types restate the
 # notification rules as configured in the tpl_unilever resource; Fatigue Driving's text is built from
 # compliance_config.json at request time.
@@ -294,6 +302,7 @@ class FleetViolationMonitor:
         # one timeline row per message, newest first: show each row's time in PKT
         for row, m in zip(result["timeline"], reversed(stream)):
             row["time"] = fmt_time(m["t"])
+            row["time_unix"] = m["t"]
         fatigue = [self._fatigue_violation(uid, v) for v in result["violations"]
                    if v.get("violation_type") == "CONTINUOUS_DRIVE_EXCEEDED"]
         return result, fatigue
@@ -370,18 +379,30 @@ class FleetViolationMonitor:
                                error=None)
             self._save_cache()
 
-    def vehicle_report(self, uid):
-        """Re-read one vehicle's full window from Wialon, recompute it, and return engine output + violations."""
-        now = int(time.time())
-        window_from = now - WINDOW_SEC
+    def vehicle_report(self, uid, window_from=None, window_to=None, lead_sec=0):
+        """
+        Re-read one vehicle's window from Wialon, recompute it, and return engine output + violations.
+
+        With no window this is the live last 24 hours, and the result refreshes the monitor's own state.
+        Given a window (inspecting the span one violation was raised on) the telemetry is read from
+        lead_sec earlier so the engine's dwell/rest counters are warm, the timeline is then cut back to
+        the window asked for, and the monitor's 24h state is left alone.
+        """
+        live = window_from is None and window_to is None
+        if live:
+            window_to = int(time.time())
+            window_from = window_to - WINDOW_SEC
+            lead_sec = 0
+        fetch_from = window_from - max(0, lead_sec)
+
         drivers = self._drivers()
         if uid not in self.units:
             with self._session() as s:
                 self.units = {u["id"]: u["nm"] for u in s.search("avl_unit", 1)}
 
         with self._session() as s:
-            res = s.call("core/batch", {"params": telemetry_call(uid, window_from, now), "flags": 0})
-            events = self._fetch_events(s, [uid], window_from, now, drivers)[uid]
+            res = s.call("core/batch", {"params": telemetry_call(uid, fetch_from, window_to), "flags": 0})
+            events = self._fetch_events(s, [uid], window_from, window_to, drivers)[uid]
         loaded, msgs = res[0], res[1]
         if not isinstance(loaded, dict) or "count" not in loaded:
             raise RuntimeError(f"load_interval failed for unit {uid}: {loaded}")
@@ -389,16 +410,20 @@ class FleetViolationMonitor:
             raise RuntimeError(f"unit {uid}: Wialon loaded {loaded['count']} messages but returned a different amount")
         rows = sorted((message_row(m) for m in (msgs if loaded["count"] else [])), key=lambda r: r[0])
 
-        result, fatigue = self._analyze(uid, rows, window_from, drivers)
+        result, fatigue = self._analyze(uid, rows, fetch_from, drivers)
+        if not live:
+            # the lead-in was read to warm the engine up, not to be shown
+            result["timeline"] = [r for r in result["timeline"] if window_from <= r["time_unix"] <= window_to]
         vios = self._with_telemetry(fatigue + events, rows)
-        with self._lock:
-            self.messages[uid] = rows
-            if vios:
-                self.violations[uid] = vios
-            else:
-                self.violations.pop(uid, None)
-        return {"window_from": window_from, "window_to": now, "result": result, "violations": vios,
-                "messages": len(rows)}
+        if live:
+            with self._lock:
+                self.messages[uid] = rows
+                if vios:
+                    self.violations[uid] = vios
+                else:
+                    self.violations.pop(uid, None)
+        return {"window_from": window_from, "window_to": window_to, "result": result, "violations": vios,
+                "messages": len(result["timeline"])}
 
     def snapshot(self):
         with self._lock:

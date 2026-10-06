@@ -10,21 +10,29 @@ of downloading telemetry. Tables are created by supabase_violations_schema.sql.
 A day is written as: mark it "building", delete its old rows, insert the new ones, mark it "done".
 Readers only trust days marked "done", so a job that dies half way leaves the day to be rebuilt,
 never half a day that looks complete.
+
+prune() drops days that have fallen out of the archive window, so the tables settle at the size of
+that window instead of growing for ever. Reviews are deliberately left out of it: see the method.
 """
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import fleet_violations as fv
+import notifier
 
 VIOLATIONS = "portal_violations"
 DAYS = "portal_archive_days"
 REVIEWS = "portal_violation_reviews"
+ALERTS = "portal_fatigue_alerts"
 VERDICTS = ("GENUINE", "FALSE")
 PAGE = 1000          # PostgREST returns at most this many rows per request
 LOAD_WORKERS = 6     # pages fetched at once when reading a long period
 INSERT_CHUNK = 500
+# enqueue() will not offer a violation older than MAX_ALERT_AGE_DAYS again, so an alert row past that
+# age (with room to spare) can no longer stop a second email and is only taking up space.
+ALERT_KEEP_DAYS = notifier.MAX_ALERT_AGE_DAYS + 4
 
 # violation record key -> column; everything the portal shows for a violation
 COLUMNS = ["id", "type", "type_label", "source", "time_unix", "vehicle_id", "vehicle", "driver",
@@ -179,3 +187,35 @@ class ViolationStore:
                 for res in ex.map(page, starts):
                     rows += res.data or []
         return [from_row(r) for r in rows]
+
+    # ------------------------------------------------------------------ retention
+    def prune(self, keep_days):
+        """Delete archived days older than keep_days. Returns {table: rows deleted}.
+
+        keep_days has to stay clear of the window catch_up() rebuilds (reports.ARCHIVE_DAYS): pruning a
+        day that is still in it makes catch_up find the day missing and download it from Wialon again,
+        on every run. Violations go before the day row, so a prune that dies half way through leaves a
+        day that reports read as never calculated -- which by then it is -- rather than one that looks
+        calculated and empty.
+
+        Reviews are never pruned. Everything else here can be rebuilt from Wialon; a person's verdict on
+        a violation cannot, and the table costs a few hundred bytes a row.
+        """
+        today = datetime.now(fv.PKT).date()
+        deleted = {}
+        cutoff = (today - timedelta(days=keep_days)).isoformat()
+        deleted[VIOLATIONS] = self._delete_before(VIOLATIONS, cutoff)
+        deleted[DAYS] = self._delete_before(DAYS, cutoff)
+        alert_cutoff = (today - timedelta(days=ALERT_KEEP_DAYS)).isoformat()
+        deleted[ALERTS] = self._delete_before(ALERTS, alert_cutoff, sent_only=True)
+        return deleted
+
+    def _delete_before(self, table, cutoff, sent_only=False):
+        """Rows with day < cutoff. "minimal" stops Supabase returning every row it deleted, which on a
+        first prune of a table left to grow is megabytes of egress for a number we get from count."""
+        query = self.client.table(table).delete(count="exact", returning="minimal").lt("day", cutoff)
+        if sent_only:
+            # keep a row the worker could still act on; one it has given up on (attempts exhausted) has
+            # nothing left to do and would otherwise sit there for ever
+            query = query.or_(f"status.neq.queued,attempts.gte.{notifier.MAX_ATTEMPTS}")
+        return query.execute().count or 0

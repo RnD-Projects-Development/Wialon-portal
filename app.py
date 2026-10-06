@@ -34,6 +34,9 @@ import notifier
 import fatigue_engine
 import fleet_violations
 import reports
+import regions
+import review_modal
+import theme
 import dashboard_data
 import dashboard_export
 import dashboard_page
@@ -44,7 +47,11 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "wialon_output")
 
+# Read from .env only (supabase_client copies it into the environment on import). Never write a token
+# here: code is committed, and a token in a commit stays in the history.
 WIALON_TOKEN = os.environ.get("WIALON_TOKEN", "")
+if not WIALON_TOKEN:
+    print("[Wialon] WIALON_TOKEN is not set in .env: live Wialon data is unavailable.")
 WIALON_BASE_URL = os.environ.get("WIALON_BASE_URL", "https://hst-api.wialon.eu")
 
 SSL_CTX = ssl.create_default_context()
@@ -569,48 +576,74 @@ def api_vehicles():
         "live_timestamp": datetime.now(fleet_violations.PKT).strftime("%Y-%m-%d %H:%M:%S")
     })
 
-@app.route("/api/vehicle-report")
-def api_vehicle_report():
+def requested_window(args):
     """
-    Inspect view for one vehicle over the last 24 hours: its full telemetry stream re-read from
-    Wialon, Fatigue Driving evaluated on every message, and its Wialon notification violations.
+    The 'from'/'to' epoch-second pair an inspection request may carry, or (None, None) for the live
+    last 24 hours. Raises ValueError with the message to show the caller.
     """
-    vehicle_id = request.args.get("vehicleId", "").strip()
-    vehicle_name = request.args.get("vehicleName", "Selected Vehicle")
-    if not vehicle_id.isdigit():
-        return jsonify({"error": "vehicleId is required"}), 400
+    window_from, window_to = args.get("from", "").strip(), args.get("to", "").strip()
+    if bool(window_from) != bool(window_to):
+        raise ValueError("from and to must be given together")
+    if not window_from:
+        return None, None
+    if not (window_from.isdigit() and window_to.isdigit()):
+        raise ValueError("from and to must be epoch seconds")
+    window_from, window_to = int(window_from), int(window_to)
+    if window_to <= window_from:
+        raise ValueError("to must be later than from")
+    # one violation never spans more than the monitor's own window; keep Wialon reads bounded
+    if window_to - window_from > fleet_violations.WINDOW_SEC:
+        raise ValueError("the window may not exceed 24 hours")
+    return window_from, window_to
 
-    bypass_cache = request.args.get("bypass_cache", "0").lower() in ["1", "true", "yes"]
-    cache_key = f"inspect:{vehicle_id}"
+
+def inspection_payload(vehicle_id, vehicle_name, window_from, window_to, bypass_cache=False):
+    """
+    One vehicle's telemetry stream over the window, geocoded, with its violations. Returns
+    (payload, from_cache); the cache is what makes exporting the stream you are looking at free.
+    """
+    cache_key = f"inspect:{vehicle_id}:{window_from}:{window_to}"
     if not bypass_cache:
-        cached_report = INSPECTION_CACHE.get(cache_key)
-        if cached_report is not None:
-            resp = jsonify(cached_report)
-            resp.headers["X-Cache"] = "HIT"
-            return resp
+        cached = INSPECTION_CACHE.get(cache_key)
+        if cached is not None:
+            return cached, True
 
-    try:
-        report = MONITOR.vehicle_report(int(vehicle_id))
-    except Exception as exc:
-        print(f"[Vehicle Report] Failed for {vehicle_name} ({vehicle_id}): {exc}")
-        return jsonify({"error": f"Could not load telemetry for {vehicle_name} from Wialon: {exc}"}), 502
-
+    report = MONITOR.vehicle_report(int(vehicle_id), window_from, window_to,
+                                    lead_sec=fleet_violations.TELEMETRY_LEAD_SEC)
     timeline = report["result"].get("timeline", [])
 
-    # Geocode timeline locations
+    # Geocode timeline locations, keeping the coordinates the address is about
     if timeline:
         coords_to_geo = []
         for row in timeline:
             try:
                 lat_s, lon_s = row.get("location", "").split(",", 1)
-                coords_to_geo.append({"lat": float(lat_s.strip()), "lon": float(lon_s.strip())})
+                row["lat"], row["lon"] = float(lat_s.strip()), float(lon_s.strip())
             except ValueError:
-                coords_to_geo.append({"lat": 0.0, "lon": 0.0})
+                row["lat"] = row["lon"] = None
+            coords_to_geo.append({"lat": row["lat"] or 0.0, "lon": row["lon"] or 0.0})
         for row, g in zip(timeline, batch_geocode_coords(coords_to_geo)):
             if g and g != "No GPS Fix":
                 row["location"] = g
 
     violations = with_locations(report["violations"])
+
+    # Tag telemetry message rows with any violations that occurred at that time
+    if timeline and violations:
+        for v in violations:
+            v_time = v.get("time_unix")
+            if v_time is None:
+                continue
+            closest_row = min(timeline, key=lambda r: abs(r.get("time_unix", 0) - v_time))
+            if abs(closest_row.get("time_unix", 0) - v_time) <= 300:
+                v_type = v.get("type", "VIOLATION")
+                v_label = fleet_violations.TYPE_LABELS.get(v_type, v_type)
+                curr_status = closest_row.get("status", "")
+                if not curr_status or curr_status == "Normal":
+                    closest_row["status"] = f"VIOLATION ({v_label})"
+                elif "VIOLATION" not in curr_status and "BREACH" not in curr_status:
+                    closest_row["status"] = f"VIOLATION ({v_label})"
+
     driver = fetch_live_drivers_from_wialon().get(int(vehicle_id)) or "Unassigned"
 
     payload = {
@@ -621,7 +654,8 @@ def api_vehicle_report():
             "from": fleet_violations.fmt_time(report["window_from"]),
             "to": fleet_violations.fmt_time(report["window_to"]),
             "from_epoch": report["window_from"],
-            "to_epoch": report["window_to"]
+            "to_epoch": report["window_to"],
+            "scoped": window_from is not None
         },
         "timeline": timeline,
         "violations": violations,
@@ -633,9 +667,37 @@ def api_vehicle_report():
         }
     }
     INSPECTION_CACHE.set(cache_key, payload, ttl_seconds=120)
+    return payload, False
+
+
+@app.route("/api/vehicle-report")
+def api_vehicle_report():
+    """
+    Inspect view for one vehicle: its telemetry stream re-read from Wialon, Fatigue Driving evaluated on
+    every message, and its Wialon notification violations.
+
+    Without 'from'/'to' this is the live last 24 hours. With them it is the span a single violation was
+    raised on - the continuous drive run for Fatigue Driving, a few minutes either side of the trigger
+    for a notification alert - so the stream shows what the vehicle was doing when the alert fired.
+    """
+    vehicle_id = request.args.get("vehicleId", "").strip()
+    vehicle_name = request.args.get("vehicleName", "Selected Vehicle")
+    if not vehicle_id.isdigit():
+        return jsonify({"error": "vehicleId is required"}), 400
+    try:
+        window_from, window_to = requested_window(request.args)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    bypass_cache = request.args.get("bypass_cache", "0").lower() in ["1", "true", "yes"]
+    try:
+        payload, from_cache = inspection_payload(vehicle_id, vehicle_name, window_from, window_to, bypass_cache)
+    except Exception as exc:
+        print(f"[Vehicle Report] Failed for {vehicle_name} ({vehicle_id}): {exc}")
+        return jsonify({"error": f"Could not load telemetry for {vehicle_name} from Wialon: {exc}"}), 502
 
     resp = jsonify(payload)
-    resp.headers["X-Cache"] = "MISS"
+    resp.headers["X-Cache"] = "HIT" if from_cache else "MISS"
     return resp
 
 def build_compliance_report(selected_vehicle=None):
@@ -739,6 +801,9 @@ def api_export_csv():
                 idx,
                 vio.get("vehicle", "Unknown"),
                 vio.get("driver", "Unassigned"),
+                # a vehicle with no region set in Wialon is left blank, so the column filters cleanly
+                None if (vio.get("vehicle_region") or regions.UNASSIGNED) == regions.UNASSIGNED
+                else vio.get("vehicle_region"),
                 vio.get("time", "-"),
                 vio.get("type_label", vio.get("type")),
                 vio["continuous_drive_minutes"] if vio.get("continuous_drive_minutes") else "",
@@ -820,14 +885,77 @@ def api_wialon_limits():
         print(f"[Wialon limits] {e}")
         return jsonify({"limits": [], "error": str(e)}), 502
 
+def write_styled_sheet(ws, columns, rows):
+    """
+    The portal's one Excel look, shared by every xlsx export: deep purple header, banded rows, thin
+    borders, autofilter, frozen header row, landscape A4 fitted one page wide with the header repeated.
+
+    columns is a list of (title, width, horizontal alignment, wrap, number format); rows is a list of
+    value lists in the same order. Rows whose wrapping columns overflow are given extra height.
+    """
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    header_fill = PatternFill("solid", fgColor="4C1D95")       # deep purple, matches the portal
+    band_fill = PatternFill("solid", fgColor="F3F0FA")
+    thin = Side(style="thin", color="D4D4D8")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for index, (title, width, _align, _wrap, _fmt) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=index, value=title)
+        cell.font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(index)].width = width
+    ws.row_dimensions[1].height = 30
+
+    for row_number, values in enumerate(rows, start=2):
+        banded = (row_number % 2 == 0)
+        for index, (value, (_title, _width, align, wrap, fmt)) in enumerate(zip(values, columns), 1):
+            cell = ws.cell(row=row_number, column=index, value=value)
+            cell.font = Font(name="Arial", size=10)
+            cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+            cell.border = border
+            if fmt and isinstance(value, (int, float)):
+                cell.number_format = fmt
+            if banded:
+                cell.fill = band_fill
+        # taller rows where a wrapping column runs onto more lines
+        lines = max([len(str(v)) / float(c[1] - 2) for v, c in zip(values, columns) if c[3]] + [1.0])
+        ws.row_dimensions[row_number].height = 16 * min(int(lines) + (1 if lines % 1 else 0), 4)
+
+    last_row = max(len(rows) + 1, 2)
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{last_row}"
+    ws.freeze_panes = "A2"
+
+    # printing: landscape, one page wide, header repeated on every page
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = "1:1"
+    ws.print_options.horizontalCentered = True
+    ws.page_margins.left = ws.page_margins.right = 0.3
+    ws.page_margins.top = ws.page_margins.bottom = 0.5
+    ws.sheet_view.showGridLines = False
+
+
+def xlsx_response(wb, filename):
+    import io
+    stream = io.BytesIO()
+    wb.save(stream)
+    return Response(stream.getvalue(),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
 @app.route("/api/export-xlsx", methods=["GET"])
 def api_export_xlsx():
     """Formatted Excel workbook: one row per violation in the report being viewed."""
     try:
-        import io
         from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-        from openpyxl.utils import get_column_letter
 
         preset = request.args.get("preset", "").upper()
         if preset in PERIOD_PRESETS:
@@ -845,6 +973,7 @@ def api_export_xlsx():
             ("#", 6, "center", False, "0"),
             ("Vehicle", 16, "center", False, None),
             ("Driver", 26, "left", False, None),
+            ("Region", 16, "center", False, None),
             ("Violation Time (PKT)", 21, "center", False, None),
             ("Violation Type", 30, "left", False, None),
             ("Review", 11, "center", False, None),
@@ -860,88 +989,126 @@ def api_export_xlsx():
             ("Details", 80, "left", True, None),
         ]
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Violations"
-
-        header_fill = PatternFill("solid", fgColor="4C1D95")       # deep purple, matches the portal
-        band_fill = PatternFill("solid", fgColor="F3F0FA")
-        thin = Side(style="thin", color="D4D4D8")
-        border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-        for index, (title, width, _align, _wrap, _fmt) in enumerate(columns, 1):
-            cell = ws.cell(row=1, column=index, value=title)
-            cell.font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = border
-            ws.column_dimensions[get_column_letter(index)].width = width
-        ws.row_dimensions[1].height = 30
-
-        for row_number, vio in enumerate(rows, start=2):
+        values = []
+        for number, vio in enumerate(rows, start=1):
             tel = vio.get("telemetry") or {}
-            speed = tel.get("speed_kmh", vio.get("speed_kmh"))
-            details = vio.get("details", "")
-            location = vio.get("location", "")
-            values = [
-                row_number - 1,
+            values.append([
+                number,
                 vio.get("vehicle", "Unknown"),
                 vio.get("driver", "Unassigned"),
+                # a vehicle with no region set in Wialon is left blank, so the column filters cleanly
+                None if (vio.get("vehicle_region") or regions.UNASSIGNED) == regions.UNASSIGNED
+                else vio.get("vehicle_region"),
                 vio.get("time", "-"),
                 vio.get("type_label", vio.get("type")),
                 {"GENUINE": "Genuine", "FALSE": "False"}.get(vio.get("verdict"), "Pending"),
                 vio.get("continuous_drive_minutes"),
                 vio.get("period"),
                 vio.get("rest_minutes"),
-                speed,
+                tel.get("speed_kmh", vio.get("speed_kmh")),
                 ("IGN ON" if tel.get("ignition") == 1 else "IGN OFF") if tel else None,
                 tel.get("odometer_km"),
-                location,
+                vio.get("location", ""),
                 vio.get("lat"),
                 vio.get("lon"),
-                details,
-            ]
-            banded = (row_number % 2 == 0)
-            for index, (value, (_title, _width, align, wrap, fmt)) in enumerate(zip(values, columns), 1):
-                cell = ws.cell(row=row_number, column=index, value=value)
-                cell.font = Font(name="Arial", size=10)
-                cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
-                cell.border = border
-                if fmt and isinstance(value, (int, float)):
-                    cell.number_format = fmt
-                if banded:
-                    cell.fill = band_fill
-            # taller rows where Location or Details wrap onto more lines
-            lines = max(len(str(details)) / 78.0, len(str(location)) / 44.0, 1)
-            ws.row_dimensions[row_number].height = 16 * min(int(lines) + (1 if lines % 1 else 0), 4)
+                vio.get("details", ""),
+            ])
 
-        last_row = max(len(rows) + 1, 2)
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{last_row}"
-        ws.freeze_panes = "A2"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Violations"
+        write_styled_sheet(ws, columns, values)
 
-        # printing: landscape, one page wide, header repeated on every page
-        ws.page_setup.orientation = "landscape"
-        ws.page_setup.paperSize = ws.PAPERSIZE_A4
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-        ws.print_title_rows = "1:1"
-        ws.print_options.horizontalCentered = True
-        ws.page_margins.left = ws.page_margins.right = 0.3
-        ws.page_margins.top = ws.page_margins.bottom = 0.5
-        ws.sheet_view.showGridLines = False
-
-        stream = io.BytesIO()
-        wb.save(stream)
-        stream.seek(0)
         period = payload["label"].replace(" ", "_")
-        filename = f"Violations_{period}_{datetime.now(fleet_violations.PKT):%Y%m%d_%H%M}.xlsx"
-        return Response(stream.getvalue(),
-                        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        headers={"Content-Disposition": f"attachment; filename={filename}"})
+        return xlsx_response(wb, f"Violations_{period}_{datetime.now(fleet_violations.PKT):%Y%m%d_%H%M}.xlsx")
     except Exception as e:
         print(f"[Export XLSX] Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/export-telemetry-xlsx", methods=["GET"])
+def api_export_telemetry_xlsx():
+    """
+    The inspection view's telemetry stream as an Excel workbook, in the same look as the violations
+    export: one row per Wialon message over the window the alert was raised on.
+
+    Takes the same vehicleId/from/to as /api/vehicle-report, so it serves the stream already on screen
+    straight out of the inspection cache. 'order' follows the table's Oldest/Newest first toggle;
+    'runFrom'/'runTo' bracket the continuous drive run, which fills the In Run column.
+    """
+    try:
+        from openpyxl import Workbook
+
+        vehicle_id = request.args.get("vehicleId", "").strip()
+        vehicle_name = request.args.get("vehicleName", "Selected Vehicle").strip() or "Selected Vehicle"
+        if not vehicle_id.isdigit():
+            return jsonify({"status": "error", "message": "vehicleId is required"}), 400
+        try:
+            window_from, window_to = requested_window(request.args)
+        except ValueError as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 400
+
+        run_from, run_to = request.args.get("runFrom", "").strip(), request.args.get("runTo", "").strip()
+        run_from = int(run_from) if run_from.isdigit() else None
+        run_to = int(run_to) if run_to.isdigit() else None
+        newest_first = request.args.get("order", "asc").lower() == "desc"
+
+        payload, _ = inspection_payload(vehicle_id, vehicle_name, window_from, window_to)
+        # the engine returns the stream newest first; the sheet follows the table's toggle
+        timeline = payload["timeline"] if newest_first else list(reversed(payload["timeline"]))
+
+        columns = [
+            ("#", 6, "center", False, "0"),
+            ("Message Time (PKT)", 21, "center", False, None),
+            ("Speed (km/h)", 12, "center", False, "0.0"),
+            ("Ignition", 11, "center", False, None),
+            ("Drive / Stop Timer", 16, "center", False, None),
+            ("State", 22, "left", False, None),
+            ("In Run", 9, "center", False, None),
+            ("Location", 46, "left", True, None),
+            ("Latitude", 12, "center", False, "0.000000"),
+            ("Longitude", 12, "center", False, "0.000000"),
+            ("Status", 40, "left", True, None),
+        ]
+
+        values = []
+        for number, row in enumerate(timeline, start=1):
+            t = row.get("time_unix")
+            if run_from is None or run_to is None or t is None:
+                in_run = "-"                    # no continuous drive run to be inside of
+            else:
+                in_run = "Yes" if run_from <= t <= run_to else "No"
+            values.append([
+                number,
+                row.get("time", "-"),
+                row.get("speed"),
+                "IGN ON" if row.get("ignition") == "ON" else "IGN OFF",
+                row.get("dwell_rest"),
+                row.get("state"),
+                in_run,
+                row.get("location", ""),
+                row.get("lat"),
+                row.get("lon"),
+                row.get("status", ""),
+            ])
+
+        wb = Workbook()
+        ws = wb.active
+        # Excel sheet names cannot hold []:*?/\ and stop at 31 characters
+        ws.title = re.sub(r"[\[\]:*?/\\]", "-", f"Telemetry {vehicle_name}")[:31]
+        write_styled_sheet(ws, columns, values)
+
+        plate = re.sub(r"[^A-Za-z0-9_-]+", "-", vehicle_name).strip("-") or "vehicle"
+        if window_from:
+            stamp = (f"{datetime.fromtimestamp(window_from, fleet_violations.PKT):%Y%m%d_%H%M}"
+                     f"-{datetime.fromtimestamp(window_to, fleet_violations.PKT):%H%M}")
+        else:
+            stamp = f"last24h_{datetime.now(fleet_violations.PKT):%Y%m%d_%H%M}"
+        return xlsx_response(wb, f"Telemetry_{plate}_{stamp}.xlsx")
+    except Exception as e:
+        print(f"[Export Telemetry XLSX] Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.route("/api/export-dashboard-xlsx", methods=["GET"])
 def api_export_dashboard_xlsx():
@@ -1178,6 +1345,100 @@ def api_dashboard():
     return send_cached(entry)
 
 
+# The dashboard's charts are counts; this is the one view that needs the violations behind a count, so
+# it is fetched only when someone opens a type rather than shipped with every dashboard load.
+TYPE_VIOLATIONS_MAX = 1000
+
+
+def type_violations_payload(preset, vtype):
+    time_from, time_to, label = preset_window(preset)
+    rep = REPORTS.build_report(time_from, time_to, label)
+    # verdicts are shown per row, so the review fingerprint has to be part of the cache version
+    version = (report_version(rep), REPORTS.reviews_fingerprint(), vtype, TYPE_VIOLATIONS_MAX)
+
+    def build():
+        payload = report_payload(rep)
+        rows = [v for item in payload["vehicles"] for v in item["violations"] if v["type"] == vtype]
+        rows.sort(key=lambda v: v["time_unix"], reverse=True)
+        shown = rows[:TYPE_VIOLATIONS_MAX]
+        return {
+            "type": vtype,
+            "type_label": fleet_violations.TYPE_LABELS.get(vtype, vtype),
+            "preset": preset,
+            "period": {"label": label, "from": payload["from"], "to": payload["to"]},
+            "total": len(rows),
+            "shown": len(shown),
+            "truncated": len(rows) > len(shown),
+            # only what the list draws, so a busy type stays a small response
+            "violations": [{
+                "time": v.get("time"),
+                "time_unix": v.get("time_unix"),
+                "vehicle": v.get("vehicle"),
+                "vehicle_id": v.get("vehicle_id"),
+                "driver": v.get("driver") or "Unassigned",
+                "verdict": v.get("verdict"),
+                "location": v.get("location") or v.get("address") or "",
+                "speed_kmh": v.get("speed_kmh"),
+                "continuous_drive_minutes": v.get("continuous_drive_minutes"),
+            } for v in shown],
+        }
+    return cached_json(f"type-violations:{vtype}", preset, version, build)
+
+
+def vehicle_violations_payload(preset, vehicle_id):
+    time_from, time_to, label = preset_window(preset)
+    rep = REPORTS.build_report(time_from, time_to, label)
+    version = (report_version(rep), REPORTS.reviews_fingerprint(), vehicle_id)
+
+    def build():
+        payload = report_payload(rep)
+        item = next((i for i in payload["vehicles"] if int(i["id"]) == vehicle_id), None)
+        rows = sorted(item["violations"] if item else [], key=lambda v: v["time_unix"], reverse=True)
+        return {
+            "vehicle_id": vehicle_id,
+            "vehicle": (item or {}).get("vehicle"),
+            "preset": preset,
+            "period": {"label": label, "from": payload["from"], "to": payload["to"]},
+            "total": len(rows),
+            "violations": rows,
+        }
+    return cached_json(f"vehicle-violations:{vehicle_id}", preset, version, build)
+
+
+@app.route("/api/dashboard/vehicle-violations")
+def api_dashboard_vehicle_violations():
+    """One vehicle's violations for a period, for the review workbench opened from a dashboard chart."""
+    preset = request.args.get("preset", "7D").upper()
+    vehicle_id = request.args.get("vehicleId", "").strip()
+    if preset not in PERIOD_PRESETS:
+        return jsonify({"error": "preset must be 1D, 7D, 15D or 30D"}), 400
+    if not vehicle_id.isdigit():
+        return jsonify({"error": "vehicleId is required"}), 400
+    try:
+        entry = vehicle_violations_payload(preset, int(vehicle_id))
+    except Exception as e:
+        print(f"[Dashboard] vehicle-violations {vehicle_id}: {e}")
+        return jsonify({"error": f"Could not load violations for this vehicle: {e}"}), 500
+    return send_cached(entry)
+
+
+@app.route("/api/dashboard/type-violations")
+def api_dashboard_type_violations():
+    """The individual violations behind one bar of the dashboard's Genuine vs False chart."""
+    preset = request.args.get("preset", "7D").upper()
+    vtype = request.args.get("type", "").strip().upper()
+    if preset not in PERIOD_PRESETS:
+        return jsonify({"error": "preset must be 1D, 7D, 15D or 30D"}), 400
+    if vtype not in VIOLATION_TYPE_KEYS:
+        return jsonify({"error": f"Unknown violation type {vtype}"}), 400
+    try:
+        entry = type_violations_payload(preset, vtype)
+    except Exception as e:
+        print(f"[Dashboard] type-violations {vtype}: {e}")
+        return jsonify({"error": f"Could not load {vtype} violations: {e}"}), 500
+    return send_cached(entry)
+
+
 @app.route("/api/review", methods=["POST"])
 def api_review():
     """Mark one violation Genuine or False (verdict null clears it back to pending)."""
@@ -1238,16 +1499,6 @@ def api_config():
         return jsonify({"status": "success", "config": payload})
 
     return jsonify(fatigue_engine.get_compliance_config())
-
-@app.route("/api/sync-supabase", methods=["POST", "GET"])
-def api_sync_supabase():
-    """Manual sync of compliance reports to Supabase Cloud."""
-    res = db.sync_all_to_supabase()
-    return jsonify(res)
-
-# ---------------------------------------------------------------------------
-# OPERATIONS PORTAL UI (General Fleet Table & 24h Vehicle Violation Drilldown)
-# ---------------------------------------------------------------------------
 PORTAL_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1258,57 +1509,31 @@ PORTAL_HTML = """
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    /* Palette: Space Cadet (#25344F), Slate Gray (#617891), Luminous Tan (#EBD2B2), Ice Blue (#9EC5E8), Caput Mortuum Lift (#E25763), Warm Amber (#E49767) */
-    :root {
-      --space-cadet: #25344F;
-      --slate-gray: #7C95B1;
-      --tan: #D5B893;
-      --tan-bright: #EBD2B2;
-      --coffee: #6F4D38;
-      --caput-mortuum: #632024;
-      
-      --ice-blue: #9EC5E8;
-      --ice-blue-light: #C5DDF5;
-      --alert-vibrant: #E25763;
-      --alert-soft: #FFCCD0;
-      --amber-vibrant: #E49767;
-      
-      --bg-deep: #0B1019;
-      --bg-gradient-top: #152030;
-      --panel: rgba(21, 32, 48, 0.88);
-      --panel-edge: rgba(158, 197, 232, 0.22);
-      --tan-edge: rgba(235, 210, 178, 0.45);
-      
-      --text: #FFFFFF;
-      --text-2: #C5DDF5;
-      --text-3: #7C95B1;
-    }
-    /* Root size follows the window (width and height), so every rem-based size scales with it */
-    html { font-size: clamp(12px, min(1vw, 1.8vh), 18px); }
-    body {
-      font-family: 'Inter', sans-serif;
-      margin: 0;
-      color: var(--text);
-      background-color: var(--bg-deep);
-      background:
-        radial-gradient(ellipse 65% 50% at 50% -10%, rgba(235, 210, 178, 0.18), transparent 70%),
-        radial-gradient(ellipse 70% 60% at 85% 10%, rgba(226, 87, 99, 0.12), transparent 70%),
-        linear-gradient(180deg, var(--bg-gradient-top) 0%, #111B29 45%, var(--bg-deep) 100%);
-      background-attachment: fixed;
-    }
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: #0B1019; }
-    ::-webkit-scrollbar-thumb { background: #25344F; border-radius: 4px; border: 1px solid rgba(158, 197, 232, 0.3); }
-    ::-webkit-scrollbar-thumb:hover { background: #7C95B1; }
-
-    /* Viewport-fit dashboard: header row + main; main = KPI row, type row, table panel taking the rest */
+""" + theme.FAVICON_SHIELD + theme.THEME_HEAD + """  <style>
+    /* Viewport-fit layout: header row + main; main = KPI row, filter row, table panel taking the rest */
     .app-shell { height: 100vh; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
     .app-main { display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 1rem; padding: 1.125rem 1.75rem 1.25rem; width: 100%; max-width: 120rem; margin: 0 auto; min-height: 0; box-sizing: border-box; }
     .panel { position: relative; display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; overflow: hidden; }
     .view { grid-template-rows: auto minmax(0, 1fr) auto; min-height: 0; }
     .stack { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; }
     .scroll-area { min-height: 0; overflow: auto; }
+
+    /* Inspection sub-tabs: the active one is a solid rust pill with white text, the idle one charcoal
+       on the card. The label is one span, so the flex gap only separates icon, label and count. */
+    .subtab { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.75rem; border-radius: 0.5rem;
+              font-size: 0.875rem; font-weight: 700; color: var(--ink2); border: 1px solid transparent; transition: all 150ms ease; }
+    .subtab:hover { color: var(--ink); background: var(--rail); }
+    .subtab.on { color: #FFFFFF; background: var(--brand); border-color: var(--brand-deep); box-shadow: 0 2px 8px rgba(143, 59, 59, 0.30); }
+    .subtab .scope { font-family: ui-monospace, monospace; font-weight: 600; opacity: 0.8; }
+    .subtab .count { font-family: ui-monospace, monospace; font-size: 0.75rem; font-weight: 700; line-height: 1;
+                     padding: 0.2rem 0.45rem; border-radius: 999px; background: var(--rail); color: var(--ink2); border: 1px solid var(--edge); }
+    .subtab.on .count { background: rgba(255, 255, 255, 0.18); color: #FFFFFF; border-color: rgba(255, 255, 255, 0.30); }
+
+    /* Footer strip under the inspection tables: what the stream or list is showing, as small chips */
+    .window-chip { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.15rem 0.55rem; border-radius: 999px;
+                   background: var(--card); border: 1px solid var(--edge); color: var(--ink2); font-family: ui-monospace, monospace;
+                   font-size: 0.75rem; font-weight: 600; white-space: nowrap; }
+    .window-chip i { font-size: 0.625rem; color: var(--accent); }
 
     /* Narrow or very short windows: fall back to normal page scrolling */
     @media (max-width: 1023px), (max-height: 540px) {
@@ -1317,104 +1542,84 @@ PORTAL_HTML = """
       .panel, .stack { grid-template-rows: none; }
       .scroll-area { max-height: 70vh; }
     }
-
-    .tip {
-      position: fixed; z-index: 60; max-width: 34rem; pointer-events: none;
-      background: #152030; color: #FFFFFF; border: 1px solid var(--tan-edge);
-      border-radius: 0.625rem; padding: 0.55rem 0.75rem; font-size: 0.8rem; line-height: 1.4;
-      box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, 0.75); opacity: 0; transition: opacity 120ms ease;
-      white-space: pre-wrap; overflow-wrap: anywhere;
-    }
-    .tip.show { opacity: 1; }
-
-    .glow-loader-wrapper { position: relative; width: 100%; min-height: 10rem; display: flex; align-items: center; justify-content: center; }
-    .glow-loader-wrapper::before { content: ''; position: absolute; width: 3.5rem; height: 3.5rem; border-radius: 50%; border: 0.3rem solid rgba(235, 210, 178, 0.15); box-sizing: border-box; }
-    .glow-loader-container {
-      position: relative; border-radius: 50%; height: 3.5rem; width: 3.5rem;
-      animation: rotate_3922 1.1s linear infinite;
-      background: conic-gradient(from 0deg, transparent 15%, #7C95B1 45%, #25344F 75%, #EBD2B2 100%);
-      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 0.3rem), #fff calc(100% - 0.25rem));
-      mask: radial-gradient(farthest-side, transparent calc(100% - 0.3rem), #fff calc(100% - 0.25rem));
-      filter: drop-shadow(0 0 6px #EBD2B2);
-    }
-    @keyframes rotate_3922 { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-  </style>
+""" + review_modal.STYLES + """  </style>
 </head>
-<body class="text-zinc-100">
+<body class="text-ink">
+""" + review_modal.MARKUP + """
 
   <!-- COLLAPSIBLE LEFT DRAWER (CONFIGURATIONS) -->
-  <div id="config-backdrop" onclick="toggleConfigDrawer(false)" class="fixed inset-0 bg-black/75 backdrop-blur-md z-50 transition-opacity duration-300 opacity-0 pointer-events-none"></div>
+  <div id="config-backdrop" onclick="toggleConfigDrawer(false)" class="fixed inset-0 bg-slate/40 backdrop-blur-sm z-50 transition-opacity duration-300 opacity-0 pointer-events-none"></div>
 
-  <aside id="config-drawer" class="fixed inset-y-0 left-0 z-50 w-80 sm:w-96 bg-[#152030] border-r border-[#9EC5E8]/25 shadow-2xl transform -translate-x-full transition-transform duration-300 ease-in-out flex flex-col">
-    <div class="p-4 border-b border-[#9EC5E8]/20 flex items-center justify-between bg-[#0B1019]/90">
+  <aside id="config-drawer" class="fixed inset-y-0 left-0 z-50 w-80 sm:w-96 bg-card border-r border-edge shadow-2xl transform -translate-x-full transition-transform duration-300 ease-in-out flex flex-col">
+    <div class="p-4 border-b border-edge flex items-center justify-between bg-rail">
       <div class="flex items-center gap-2.5">
-        <div class="w-8 h-8 rounded-lg bg-[#25344F] border border-[#EBD2B2]/40 flex items-center justify-center text-[#EBD2B2]">
+        <div class="w-8 h-8 rounded-lg bg-rail border border-accent/40 flex items-center justify-center text-accent-deep">
           <i class="fa-solid fa-sliders text-sm"></i>
         </div>
         <div>
-          <h2 class="text-sm font-bold text-white">Compliance Standards</h2>
-          <p class="text-[0.6875rem] text-[#9EC5E8]">Configurable Work-Rest Rules</p>
+          <h2 class="text-sm font-bold text-ink">Compliance Standards</h2>
+          <p class="text-[0.6875rem] text-ink2">Configurable Work-Rest Rules</p>
         </div>
       </div>
-      <button onclick="toggleConfigDrawer(false)" class="w-8 h-8 rounded-lg bg-[#25344F] hover:bg-[#384d72] text-[#C5DDF5] hover:text-white flex items-center justify-center transition border border-[#9EC5E8]/30" title="Close">
+      <button onclick="toggleConfigDrawer(false)" class="w-8 h-8 rounded-lg bg-rail hover:bg-head text-ink2 hover:text-ink flex items-center justify-center transition border border-edge" title="Close">
         <i class="fa-solid fa-xmark text-sm"></i>
       </button>
     </div>
 
     <div class="p-5 flex-1 overflow-y-auto space-y-4 text-xs">
-      <div class="bg-[#0B1019]/90 border border-[#9EC5E8]/25 rounded-xl p-3.5 text-[#C5DDF5] leading-relaxed text-[0.6875rem] flex items-start gap-2">
-        <i class="fa-solid fa-circle-info text-[#EBD2B2] mt-0.5 flex-shrink-0"></i>
+      <div class="bg-rail border border-edge rounded-xl p-3.5 text-ink2 leading-relaxed text-[0.6875rem] flex items-start gap-2">
+        <i class="fa-solid fa-circle-info text-accent-deep mt-0.5 flex-shrink-0"></i>
         <span>All durations are HH:MM. Fatigue Driving is recalculated for the whole fleet as soon as you save.</span>
       </div>
 
       <form id="lafarge-config-form" onsubmit="saveLafargeConfig(event)" class="space-y-3.5">
-        <div class="text-[0.6875rem] uppercase tracking-wider text-[#EBD2B2] font-bold pt-1">Fatigue Driving</div>
+        <div class="text-[0.6875rem] uppercase tracking-wider text-accent-deep font-bold pt-1">Fatigue Driving</div>
         <div class="space-y-1">
           <div class="flex items-center justify-between gap-3">
-            <span class="text-zinc-200 font-medium">Max Continuous Drive (Day):</span>
-            <input type="text" id="cfg-max-drive-day" value="02:30" placeholder="02:30" class="w-24 bg-[#0B1019] border border-[#9EC5E8]/40 rounded-lg px-2.5 py-1 text-center font-mono font-bold text-white focus:outline-none focus:border-[#EBD2B2] focus:ring-1 focus:ring-[#EBD2B2]/50">
+            <span class="text-ink2 font-medium">Max Continuous Drive (Day):</span>
+            <input type="text" id="cfg-max-drive-day" value="02:30" placeholder="02:30" class="w-24 bg-rail border border-edge rounded-lg px-2.5 py-1 text-center font-mono font-bold text-ink focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50">
           </div>
-          <span class="text-[0.6875rem] text-[#9EC5E8] block leading-snug">Driving time without a reset stop that triggers the break requirement (06:00-22:00 PKT)</span>
+          <span class="text-[0.6875rem] text-ink2 block leading-snug">Driving time without a reset stop that triggers the break requirement (06:00-22:00 PKT)</span>
         </div>
         <div class="space-y-1">
           <div class="flex items-center justify-between gap-3">
-            <span class="text-zinc-200 font-medium">Max Continuous Drive (Night):</span>
-            <input type="text" id="cfg-max-drive-night" value="02:00" placeholder="02:00" class="w-24 bg-[#0B1019] border border-[#9EC5E8]/40 rounded-lg px-2.5 py-1 text-center font-mono font-bold text-white focus:outline-none focus:border-[#EBD2B2] focus:ring-1 focus:ring-[#EBD2B2]/50">
+            <span class="text-ink2 font-medium">Max Continuous Drive (Night):</span>
+            <input type="text" id="cfg-max-drive-night" value="02:00" placeholder="02:00" class="w-24 bg-rail border border-edge rounded-lg px-2.5 py-1 text-center font-mono font-bold text-ink focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50">
           </div>
-          <span class="text-[0.6875rem] text-[#9EC5E8] block leading-snug">Same limit between 22:00 and 06:00 PKT</span>
+          <span class="text-[0.6875rem] text-ink2 block leading-snug">Same limit between 22:00 and 06:00 PKT</span>
         </div>
         <div class="space-y-1">
           <div class="flex items-center justify-between gap-3">
-            <span class="text-zinc-200 font-medium">Stop That Resets Driving Timer:</span>
-            <input type="text" id="cfg-min-reset-stop" value="00:05" placeholder="00:05" class="w-24 bg-[#0B1019] border border-[#9EC5E8]/40 rounded-lg px-2.5 py-1 text-center font-mono font-bold text-white focus:outline-none focus:border-[#EBD2B2] focus:ring-1 focus:ring-[#EBD2B2]/50">
+            <span class="text-ink2 font-medium">Stop That Resets Driving Timer:</span>
+            <input type="text" id="cfg-min-reset-stop" value="00:05" placeholder="00:05" class="w-24 bg-rail border border-edge rounded-lg px-2.5 py-1 text-center font-mono font-bold text-ink focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50">
           </div>
-          <span class="text-[0.6875rem] text-[#9EC5E8] block leading-snug">A stop (under 5 km/h or ignition off) at least this long sets the driving timer back to zero. Shorter stops do not.</span>
+          <span class="text-[0.6875rem] text-ink2 block leading-snug">A stop (under 5 km/h or ignition off) at least this long sets the driving timer back to zero. Shorter stops do not.</span>
         </div>
         <div class="space-y-1">
           <div class="flex items-center justify-between gap-3">
-            <span class="text-zinc-200 font-medium">Required Break After Limit (Day):</span>
-            <input type="text" id="cfg-min-break-day" value="00:15" placeholder="00:15" class="w-24 bg-[#0B1019] border border-[#9EC5E8]/40 rounded-lg px-2.5 py-1 text-center font-mono font-bold text-white focus:outline-none focus:border-[#EBD2B2] focus:ring-1 focus:ring-[#EBD2B2]/50">
+            <span class="text-ink2 font-medium">Required Break After Limit (Day):</span>
+            <input type="text" id="cfg-min-break-day" value="00:15" placeholder="00:15" class="w-24 bg-rail border border-edge rounded-lg px-2.5 py-1 text-center font-mono font-bold text-ink focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50">
           </div>
-          <span class="text-[0.6875rem] text-[#9EC5E8] block leading-snug">Once the limit is reached the driver must stop this long; driving on sooner is a violation</span>
+          <span class="text-[0.6875rem] text-ink2 block leading-snug">Once the limit is reached the driver must stop this long; driving on sooner is a violation</span>
         </div>
         <div class="space-y-1">
           <div class="flex items-center justify-between gap-3">
-            <span class="text-zinc-200 font-medium">Required Break After Limit (Night):</span>
-            <input type="text" id="cfg-min-break-night" value="00:15" placeholder="00:15" class="w-24 bg-[#0B1019] border border-[#9EC5E8]/40 rounded-lg px-2.5 py-1 text-center font-mono font-bold text-white focus:outline-none focus:border-[#EBD2B2] focus:ring-1 focus:ring-[#EBD2B2]/50">
+            <span class="text-ink2 font-medium">Required Break After Limit (Night):</span>
+            <input type="text" id="cfg-min-break-night" value="00:15" placeholder="00:15" class="w-24 bg-rail border border-edge rounded-lg px-2.5 py-1 text-center font-mono font-bold text-ink focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50">
           </div>
-          <span class="text-[0.6875rem] text-[#9EC5E8] block leading-snug">Same break requirement between 22:00 and 06:00 PKT</span>
+          <span class="text-[0.6875rem] text-ink2 block leading-snug">Same break requirement between 22:00 and 06:00 PKT</span>
         </div>
         <div class="pt-4">
-          <button type="submit" class="w-full py-2.5 px-4 rounded-xl text-xs font-extrabold bg-gradient-to-r from-[#6F4D38] to-[#632024] hover:brightness-110 text-white shadow-lg shadow-[#632024]/40 border border-[#EBD2B2]/30 transition flex items-center justify-center gap-2">
+          <button type="submit" class="w-full py-2.5 px-4 rounded-xl text-xs font-extrabold bg-brand hover:bg-brand-deep text-ice shadow-md shadow-brand/30 border border-brand-deep transition flex items-center justify-center gap-2">
             <i class="fa-solid fa-floppy-disk"></i>
             <span>Save Configuration</span>
           </button>
         </div>
       </form>
       <div class="pt-2">
-        <div class="text-[0.6875rem] uppercase tracking-wider text-[#9EC5E8] font-bold pb-2">Wialon alert limits</div>
-        <div id="wialon-limits" class="space-y-2 text-xs text-zinc-200">Loading...</div>
-        <p class="text-[0.6875rem] text-[#9EC5E8] leading-snug pt-2">These six alerts are recorded by Wialon itself, so their limits live in the Wialon notifications. The portal reads them here but cannot change them.</p>
+        <div class="text-[0.6875rem] uppercase tracking-wider text-ink2 font-bold pb-2">Wialon alert limits</div>
+        <div id="wialon-limits" class="space-y-2 text-xs text-ink2">Loading...</div>
+        <p class="text-[0.6875rem] text-ink2 leading-snug pt-2">These six alerts are recorded by Wialon itself, so their limits live in the Wialon notifications. The portal reads them here but cannot change them.</p>
       </div>
     </div>
   </aside>
@@ -1425,33 +1630,38 @@ PORTAL_HTML = """
   <div class="app-shell">
 
     <!-- TOP HEADER BAR -->
-    <header class="border-b border-[#9EC5E8]/20 bg-[#152030]/95 backdrop-blur z-40">
+    <header class="bg-slate shadow-md shadow-slate/20 z-40">
       <div class="max-w-[120rem] mx-auto px-7 h-16 flex items-center justify-between">
         <div class="flex items-center gap-3.5">
-          <div class="w-11 h-11 rounded-xl bg-gradient-to-tr from-[#25344F] via-[#6F4D38] to-[#EBD2B2] border border-[#EBD2B2]/40 flex items-center justify-center shadow-lg shadow-black/50">
+          <div class="w-11 h-11 rounded-xl bg-gradient-to-tr from-brand-deep via-brand to-accent border border-white/15 flex items-center justify-center shadow-md shadow-slate-deep/40">
             <i class="fa-solid fa-shield-halved text-white text-lg"></i>
           </div>
           <div>
             <h1 class="font-bold text-xl text-white leading-tight tracking-tight">Vehicle Operations &amp; Compliance Portal</h1>
-            <p class="text-xs text-[#9EC5E8] font-mono">Violation reports · all times PKT (UTC+5)</p>
+            <p class="text-xs text-ice font-mono">Violation reports · all times PKT (UTC+5)</p>
           </div>
         </div>
 
         <div class="flex items-center gap-3">
-          <button onclick="toggleConfigDrawer(true)" class="px-4 py-2 rounded-xl text-sm font-bold bg-[#25344F] hover:bg-[#384d72] text-[#FFFFFF] border border-[#9EC5E8]/35 hover:border-[#EBD2B2] transition flex items-center gap-2 shadow-sm">
-            <i class="fa-solid fa-sliders text-[#EBD2B2]"></i>
+          <button onclick="toggleConfigDrawer(true)" class="px-4 py-2 rounded-xl text-sm font-bold bg-card hover:bg-rail text-ink border border-edge2 hover:border-accent transition flex items-center gap-2 shadow-sm">
+            <i class="fa-solid fa-sliders text-accent-deep"></i>
             <span>Configurations</span>
           </button>
-          <button onclick="openDashboard()" title="Charts and headline figures for this period" class="px-3.5 py-2 bg-[#25344F] hover:bg-[#384d72] text-[#FFFFFF] border border-[#9EC5E8]/35 hover:border-[#EBD2B2] rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
-            <i class="fa-solid fa-chart-column text-[#EBD2B2]"></i>
+          <button onclick="openReviewModal()" title="Mark violations Genuine or False across the whole fleet" class="px-3.5 py-2 bg-brand hover:bg-brand-deep text-ice-lt border border-brand rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
+            <i class="fa-solid fa-gavel"></i>
+            <span>Review</span>
+            <span id="review-pending-badge" class="hidden px-1.5 py-0.5 rounded-full bg-card text-brand-deep text-[0.625rem] font-extrabold font-mono">0</span>
+          </button>
+          <button onclick="openDashboard()" title="Charts and headline figures for this period" class="px-3.5 py-2 bg-card hover:bg-rail text-ink border border-edge2 hover:border-accent rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
+            <i class="fa-solid fa-chart-column text-accent-deep"></i>
             <span>Dashboard</span>
           </button>
-          <button onclick="exportFleetToExcel()" title="Formatted Excel workbook of every violation in this report" class="px-3.5 py-2 bg-[#25344F] hover:bg-[#384d72] text-[#FFFFFF] border border-[#9EC5E8]/35 hover:border-[#EBD2B2] rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
-            <i class="fa-solid fa-file-excel text-[#EBD2B2]"></i>
+          <button onclick="exportFleetToExcel()" title="Formatted Excel workbook of every violation in this report" class="px-3.5 py-2 bg-card hover:bg-rail text-ink border border-edge2 hover:border-accent rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
+            <i class="fa-solid fa-file-excel text-accent-deep"></i>
             <span>Excel</span>
           </button>
-          <button onclick="loadReport()" title="Rebuild this report with the latest data" class="px-3.5 py-2 bg-[#25344F] hover:bg-[#384d72] text-[#FFFFFF] border border-[#9EC5E8]/35 hover:border-[#EBD2B2] rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
-            <i id="btn-refresh-icon" class="fa-solid fa-rotate text-[#EBD2B2]"></i>
+          <button onclick="loadReport()" title="Rebuild this report with the latest data" class="px-3.5 py-2 bg-card hover:bg-rail text-ink border border-edge2 hover:border-accent rounded-xl text-sm font-semibold transition flex items-center gap-2 shadow-sm">
+            <i id="btn-refresh-icon" class="fa-solid fa-rotate text-accent-deep"></i>
             <span>Refresh</span>
           </button>
         </div>
@@ -1461,83 +1671,86 @@ PORTAL_HTML = """
     <main class="app-main">
 
       <!-- KPI SUMMARY STRIP -->
+      <!-- Each tile is one solid colour chosen for what it counts - steel blue for the fleet, amber for
+           units at fault, red for violations, charcoal for the period - with a deeper shade of the same
+           colour behind the icon so the two halves read as one block -->
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div class="bg-[#152030]/90 rounded-2xl px-6 py-5 shadow-xl shadow-black/40 flex items-center justify-between gap-3">
+        <div class="bg-info rounded-2xl px-6 py-5 shadow-lg shadow-info/25 flex items-center justify-between gap-3">
           <div class="min-w-0">
-            <span class="text-xs uppercase tracking-wider text-[#9EC5E8] block font-semibold">Total Fleet</span>
+            <span class="text-xs uppercase tracking-wider text-ice block font-semibold">Total Fleet</span>
             <strong id="kpi-total-fleet" class="text-4xl font-extrabold text-white font-mono mt-1.5 block leading-none">0</strong>
           </div>
-          <div class="w-14 h-14 rounded-2xl bg-[#25344F] border border-[#9EC5E8]/35 text-[#9EC5E8] flex items-center justify-center flex-shrink-0">
+          <div class="w-14 h-14 rounded-2xl bg-info-deep text-ice flex items-center justify-center flex-shrink-0">
             <i class="fa-solid fa-truck text-xl"></i>
           </div>
         </div>
-        <div class="bg-[#152030]/90 rounded-2xl px-6 py-5 shadow-xl shadow-black/40 flex items-center justify-between gap-3">
+        <div class="bg-warn rounded-2xl px-6 py-5 shadow-lg shadow-warn/25 flex items-center justify-between gap-3">
           <div class="min-w-0">
-            <span class="text-xs uppercase tracking-wider text-[#9EC5E8] block font-semibold">Violating Units</span>
-            <strong id="kpi-violating-vehicles" class="text-4xl font-extrabold text-[#E25763] font-mono mt-1.5 block leading-none">0</strong>
+            <span class="text-xs uppercase tracking-wider text-ice-lt block font-semibold">Violating Units</span>
+            <strong id="kpi-violating-vehicles" class="text-4xl font-extrabold text-white font-mono mt-1.5 block leading-none">0</strong>
           </div>
-          <div class="w-14 h-14 rounded-2xl bg-[#632024]/40 border border-[#E25763]/70 text-[#E25763] flex items-center justify-center flex-shrink-0">
+          <div class="w-14 h-14 rounded-2xl bg-warn-deep text-ice-lt flex items-center justify-center flex-shrink-0">
             <i class="fa-solid fa-triangle-exclamation text-xl"></i>
           </div>
         </div>
-        <div class="bg-[#152030]/90 rounded-2xl px-6 py-5 shadow-xl shadow-black/40 flex items-center justify-between gap-3">
+        <div class="bg-danger rounded-2xl px-6 py-5 shadow-lg shadow-danger/25 flex items-center justify-between gap-3">
           <div class="min-w-0">
-            <span class="text-xs uppercase tracking-wider text-[#9EC5E8] block font-semibold">Total Violations</span>
-            <strong id="kpi-total-violations" class="text-4xl font-extrabold text-[#EBD2B2] font-mono mt-1.5 block leading-none">0</strong>
+            <span class="text-xs uppercase tracking-wider text-ice block font-semibold">Total Violations</span>
+            <strong id="kpi-total-violations" class="text-4xl font-extrabold text-white font-mono mt-1.5 block leading-none">0</strong>
           </div>
-          <div class="w-14 h-14 rounded-2xl bg-[#6F4D38]/40 border border-[#E49767]/70 text-[#EBD2B2] flex items-center justify-center flex-shrink-0">
+          <div class="w-14 h-14 rounded-2xl bg-danger-deep text-ice flex items-center justify-center flex-shrink-0">
             <i class="fa-solid fa-list-check text-xl"></i>
           </div>
         </div>
-        <div class="bg-[#152030]/90 rounded-2xl px-6 py-5 shadow-xl shadow-black/40 flex items-center justify-between gap-3">
+        <div class="bg-slate rounded-2xl px-6 py-5 shadow-lg shadow-slate/25 flex items-center justify-between gap-3">
           <div class="min-w-0">
-            <span id="kpi-scan-title" class="text-xs uppercase tracking-wider text-[#9EC5E8] block font-semibold">Report Period (Last 24h)</span>
-            <strong id="kpi-scan-status" class="text-lg font-extrabold text-[#EBD2B2] mt-1.5 block truncate leading-tight font-mono">Starting...</strong>
-            <span id="kpi-scan-detail" class="text-xs text-[#9EC5E8] font-mono block truncate mt-1">-</span>
+            <span id="kpi-scan-title" class="text-xs uppercase tracking-wider text-ice block font-semibold">Report Period (Last 24h)</span>
+            <strong id="kpi-scan-status" class="text-lg font-extrabold text-white mt-1.5 block truncate leading-tight font-mono">Starting...</strong>
+            <span id="kpi-scan-detail" class="text-xs text-ice font-mono block truncate mt-1">-</span>
           </div>
-          <div class="w-14 h-14 rounded-2xl bg-[#25344F] border border-[#9EC5E8]/35 flex items-center justify-center text-[#9EC5E8] flex-shrink-0">
+          <div class="w-14 h-14 rounded-2xl bg-slate-deep text-ice flex items-center justify-center flex-shrink-0">
             <i class="fa-solid fa-satellite-dish text-xl"></i>
           </div>
         </div>
       </div>
 
       <!-- VIOLATION TYPE BREAKDOWN (click a card to filter the table) -->
-      <div id="type-cards" class="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-3"></div>
+      <div id="type-cards" class="flex flex-wrap items-center gap-2"></div>
 
       <!-- TABLE PANEL (fills the remaining height) -->
-      <section class="panel bg-[#152030]/90 border border-[#9EC5E8]/22 rounded-2xl shadow-2xl shadow-black/50">
+      <section class="panel bg-card rounded-2xl shadow-lg shadow-slate/10">
 
         <div id="table-loading-bar" class="absolute top-0 inset-x-0 h-1 z-30 hidden overflow-hidden">
-          <div class="h-full bg-gradient-to-r from-[#25344F] via-[#6F4D38] to-[#EBD2B2] animate-pulse w-full"></div>
+          <div class="h-full bg-gradient-to-r from-brand-soft via-brand to-accent animate-pulse w-full"></div>
         </div>
 
         <!-- VIEW A: VIOLATING VEHICLES -->
         <div id="view-primary" class="view grid">
-          <div class="px-5 py-3 bg-[#0B1019]/90 border-b border-[#9EC5E8]/20 flex flex-wrap items-center justify-between gap-3">
+          <div class="px-5 py-3 bg-rail flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-2.5 flex-1 min-w-[15rem]">
               <div class="relative flex-1 max-w-sm">
-                <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-1/2 -translate-y-1/2 text-[#7C95B1] text-sm pointer-events-none"></i>
-                <input type="text" id="search-input" autocomplete="off" oninput="handleSearchInput(event)" onkeydown="handleSearchKeyDown(event)" placeholder="Search vehicle plate or driver..." class="w-full bg-[#152030] border border-[#9EC5E8]/35 rounded-xl pl-10 pr-8 py-2.5 text-sm text-white placeholder-[#7C95B1] focus:outline-none focus:border-[#EBD2B2] focus:ring-1 focus:ring-[#EBD2B2]/50">
-                <button id="search-clear-btn" onclick="clearSearchInput()" class="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#7C95B1] hover:text-white text-xs hidden w-4 h-4 flex items-center justify-center rounded-full" title="Clear">
+                <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-1/2 -translate-y-1/2 text-ink3 text-sm pointer-events-none"></i>
+                <input type="text" id="search-input" autocomplete="off" oninput="handleSearchInput(event)" onkeydown="handleSearchKeyDown(event)" placeholder="Search vehicle plate or driver..." class="w-full bg-card border border-edge rounded-xl pl-10 pr-8 py-2.5 text-sm text-ink placeholder-ink3 focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50">
+                <button id="search-clear-btn" onclick="clearSearchInput()" class="absolute right-2.5 top-1/2 -translate-y-1/2 text-ink3 hover:text-ink text-xs hidden w-4 h-4 flex items-center justify-center rounded-full" title="Clear">
                   <i class="fa-solid fa-xmark"></i>
                 </button>
               </div>
-              <div class="inline-flex p-0.5 bg-[#152030] border border-[#9EC5E8]/30 rounded-xl" title="Whole days ending yesterday; today is never included">
+              <div class="inline-flex p-0.5 bg-card border border-edge rounded-xl" title="Whole days ending yesterday; today is never included">
                 <button data-preset="1D" onclick="loadReport('1D')" class="px-3.5 py-1.5 rounded-lg text-sm font-bold transition">1D</button>
                 <button data-preset="7D" onclick="loadReport('7D')" class="px-3.5 py-1.5 rounded-lg text-sm font-bold transition">7D</button>
                 <button data-preset="15D" onclick="loadReport('15D')" class="px-3.5 py-1.5 rounded-lg text-sm font-bold transition">15D</button>
                 <button data-preset="30D" onclick="loadReport('30D')" class="px-3.5 py-1.5 rounded-lg text-sm font-bold transition">30D</button>
               </div>
-              <select id="status-filter" onchange="changeFilter()" class="bg-[#152030] border border-[#9EC5E8]/35 rounded-xl px-3 py-2.5 text-sm text-[#FFFFFF] focus:outline-none focus:border-[#EBD2B2]">
+              <select id="status-filter" onchange="changeFilter()" class="bg-card border border-edge rounded-xl px-3 py-2.5 text-sm text-ink focus:outline-none focus:border-accent">
                 <option value="ALL" selected>All Violation Types</option>
               </select>
             </div>
-            <span id="vehicles-count-label" class="text-sm font-semibold text-[#C5DDF5]">Loading violations...</span>
+            <span id="vehicles-count-label" class="text-sm font-semibold text-ink2">Loading violations...</span>
           </div>
 
           <div id="table-scroll" class="scroll-area">
             <table class="w-full text-left text-sm table-fixed">
-              <thead class="bg-[#0B1019] text-[#C5DDF5] uppercase font-bold border-b border-[#9EC5E8]/25 tracking-wider sticky top-0 z-10">
+              <thead class="bg-head text-ink uppercase font-bold border-b border-edge2 tracking-wider sticky top-0 z-10">
                 <tr>
                   <th class="w-[16%] px-4 py-3.5 text-center">Vehicle</th>
                   <th class="w-[22%] px-3 py-3.5 text-center">Driver</th>
@@ -1545,16 +1758,16 @@ PORTAL_HTML = """
                   <th class="w-[12%] px-3 py-3.5 text-center">Action</th>
                 </tr>
               </thead>
-              <tbody id="vehicles-table-body" class="divide-y divide-[#7C95B1]/20">
+              <tbody id="vehicles-table-body" class="divide-y divide-edge">
                 <tr><td colspan="4" class="p-0 text-center"><div class="glow-loader-wrapper"><div class="glow-loader-container"></div></div></td></tr>
               </tbody>
             </table>
           </div>
 
-          <div class="bg-[#0B1019]/90 border-t border-[#9EC5E8]/20 px-5 py-3 flex flex-wrap items-center justify-between gap-3 text-sm font-semibold text-[#C5DDF5]">
+          <div class="bg-rail px-5 py-3 flex flex-wrap items-center justify-between gap-3 text-sm font-semibold text-ink2">
             <div class="flex items-center gap-2">
               <span>Rows per page:</span>
-              <select id="limit-select" onchange="changeLimit()" class="bg-[#152030] border border-[#9EC5E8]/35 rounded-lg px-2.5 py-1.5 text-white text-sm focus:outline-none focus:border-[#EBD2B2]">
+              <select id="limit-select" onchange="changeLimit()" class="bg-card border border-edge rounded-lg px-2.5 py-1.5 text-ink text-sm focus:outline-none focus:border-accent">
                 <option value="fit" selected>Fit to screen</option>
                 <option value="10">10</option>
                 <option value="25">25</option>
@@ -1566,25 +1779,35 @@ PORTAL_HTML = """
         </div>
 
         <!-- VIEW B: VEHICLE INSPECTION -->
-        <div id="view-detail" class="view grid hidden bg-[#152030]/98">
-          <div class="px-5 py-3.5 bg-[#0B1019] border-b border-[#9EC5E8]/20 flex flex-wrap items-center justify-between gap-3">
+        <div id="view-detail" class="view grid hidden bg-card">
+          <div class="px-5 py-3.5 bg-rail flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-3">
-              <button onclick="slideBackToPrimary()" class="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold bg-[#25344F] hover:bg-[#384d72] text-[#FFFFFF] border border-[#9EC5E8]/35 shadow-md transition">
+              <button onclick="slideBackToPrimary()" class="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold bg-rail hover:bg-head text-ink border border-edge shadow-md transition">
                 <i class="fa-solid fa-arrow-left"></i> Back to Violations
               </button>
-              <div class="h-4 w-px bg-[#9EC5E8]/30"></div>
-              <h2 id="drilldown-title" class="text-base font-bold text-white flex items-center gap-2"><span>Vehicle Inspection:</span></h2>
+              <div class="h-4 w-px bg-edge"></div>
+              <h2 id="drilldown-title" class="text-base font-bold text-ink flex items-center gap-2"><span>Vehicle Inspection:</span></h2>
             </div>
             <div class="flex items-center gap-2">
-              <div class="inline-flex p-0.5 bg-[#152030] border border-[#9EC5E8]/35 rounded-xl">
-                <button id="btn-sub-violations" onclick="setDetailSubView('violations')" class="px-3 py-1.5 rounded-lg text-sm font-bold transition bg-gradient-to-r from-[#6F4D38] to-[#632024] text-white shadow-sm border border-[#EBD2B2]/30 flex items-center gap-1.5">
-                  <i class="fa-solid fa-triangle-exclamation"></i> Violations (<span id="detail-violations-count">0</span>)
+              <div class="inline-flex p-0.5 bg-card border border-edge rounded-xl">
+                <button id="btn-sub-violations" onclick="setDetailSubView('violations')" class="subtab on">
+                  <i class="fa-solid fa-triangle-exclamation"></i><span>Violations</span><span id="detail-violations-count" class="count">0</span>
                 </button>
-                <button id="btn-sub-timeline" onclick="setDetailSubView('timeline')" class="px-3 py-1.5 rounded-lg text-sm font-bold transition text-[#C5DDF5] hover:text-white flex items-center gap-1.5">
-                  <i class="fa-solid fa-chart-line"></i> Telemetry Stream, last 24h (<span id="detail-packets-count">0</span>)
+                <button id="btn-sub-timeline" onclick="setDetailSubView('timeline')" class="subtab">
+                  <i class="fa-solid fa-chart-line"></i><span>Telemetry Stream <span id="detail-timeline-scope" class="scope">· last 24h</span></span><span id="detail-packets-count" class="count">0</span>
                 </button>
               </div>
-              <button onclick="fetchTelemetryStream(true)" title="Reload the telemetry stream from Wialon" class="px-3 py-1.5 rounded-xl text-sm font-bold bg-[#25344F] border border-[#9EC5E8]/35 text-[#C5DDF5] hover:text-white hover:border-[#EBD2B2] transition flex items-center gap-1">
+              <button id="btn-timeline-order" onclick="toggleTimelineOrder()" class="hidden px-3 py-1.5 rounded-xl text-sm font-bold bg-rail border border-edge text-ink2 hover:text-ink hover:border-accent transition items-center gap-1.5"
+                data-tip="Switch the stream between oldest first (the drive run read forwards) and newest first">
+                <i id="btn-timeline-order-icon" class="fa-solid fa-arrow-down-short-wide text-[0.625rem]"></i>
+                <span id="btn-timeline-order-label">Oldest first</span>
+              </button>
+              <button id="btn-timeline-excel" onclick="exportTelemetryToExcel()" class="hidden px-3 py-1.5 rounded-xl text-sm font-bold bg-rail border border-edge text-ink2 hover:text-ink hover:border-accent transition items-center gap-1.5"
+                data-tip="Formatted Excel workbook of this telemetry stream, in the order shown">
+                <i class="fa-solid fa-file-excel text-[0.625rem]"></i>
+                <span>Excel</span>
+              </button>
+              <button onclick="fetchTelemetryStream(true)" title="Reload the telemetry stream from Wialon" class="px-3 py-1.5 rounded-xl text-sm font-bold bg-rail border border-edge text-ink2 hover:text-ink hover:border-accent transition flex items-center gap-1">
                 <i id="btn-inspect-refresh-icon" class="fa-solid fa-arrows-rotate text-[0.625rem]"></i>
                 <span>Refresh</span>
               </button>
@@ -1594,7 +1817,7 @@ PORTAL_HTML = """
           <div class="stack">
             <div id="drilldown-violations-section" class="scroll-area">
               <table class="w-full text-left text-sm table-fixed">
-                <thead class="bg-[#0B1019] text-[#C5DDF5] uppercase font-bold border-b border-[#9EC5E8]/25 tracking-wider sticky top-0 z-10">
+                <thead class="bg-head text-ink uppercase font-bold border-b border-edge2 tracking-wider sticky top-0 z-10">
                   <tr>
                     <th class="w-[11%] px-3 py-3.5 text-center">Violation Time (PKT)</th>
                     <th class="w-[14%] px-3 py-3.5 text-center">Violation Type</th>
@@ -1603,32 +1826,32 @@ PORTAL_HTML = """
                     <th class="w-[9%] px-2 py-3.5 text-center">Driving Hours</th>
                     <th class="w-[19%] px-3 py-3.5 text-center">Violation Location</th>
                     <th class="w-[18%] px-3 py-3.5 text-center">Details</th>
-                    <th class="w-[13%] px-2 py-3.5 text-center" data-tip="Your verdict, saved for this violation and used by the dashboard">Review</th>
+                    <th class="w-[13%] px-2 py-3.5 text-center" data-tip="Set in the Review workbench, from the Review button in the header">Review</th>
                   </tr>
                 </thead>
-                <tbody id="drilldown-violations-body" class="divide-y divide-[#7C95B1]/20"></tbody>
+                <tbody id="drilldown-violations-body" class="divide-y divide-edge"></tbody>
               </table>
             </div>
 
             <div id="drilldown-timeline-section" class="scroll-area hidden">
               <table class="w-full text-left text-sm table-fixed">
-                <thead class="bg-[#0B1019] text-[#C5DDF5] uppercase font-bold border-b border-[#9EC5E8]/25 tracking-wider sticky top-0 z-10">
+                <thead class="bg-head text-ink uppercase font-bold border-b border-edge2 tracking-wider sticky top-0 z-10">
                   <tr>
                     <th class="w-[18%] px-3 py-3.5 text-center">Message Time (PKT)</th>
                     <th class="w-[24%] px-2 py-3.5 text-center">Telemetry (Speed / Ign)</th>
-                    <th class="w-[14%] px-2 py-3.5 text-center font-mono">Dwell / Rest</th>
+                    <th class="w-[14%] px-2 py-3.5 text-center" data-tip="The timer that decides Fatigue Driving. On a driving row it is how long the vehicle has driven without a 00:05 reset stop - this is what trips the 02:30 day / 02:00 night limit. On a stopped row it is how long the current stop has lasted, which is what has to reach 00:05 to clear the drive timer.">Drive / Stop Timer</th>
                     <th class="w-[14%] px-2 py-3.5 text-center">State</th>
                     <th class="w-[20%] px-3 py-3.5 text-center">Location</th>
                     <th class="w-[10%] px-2 py-3.5 text-center">Status</th>
                   </tr>
                 </thead>
-                <tbody id="timeline-table-body" class="divide-y divide-[#7C95B1]/20 font-mono"></tbody>
+                <tbody id="timeline-table-body" class="divide-y divide-edge font-mono"></tbody>
               </table>
             </div>
           </div>
 
-          <div class="bg-[#0B1019]/90 border-t border-[#9EC5E8]/20 px-4 py-2 flex items-center justify-end text-xs font-semibold text-[#9EC5E8]">
-            <span id="drilldown-window-tag" class="text-[#9EC5E8] font-mono text-xs">24-Hour Evaluation Window</span>
+          <div class="bg-rail px-4 py-2 flex items-center justify-end text-xs font-semibold text-ink2">
+            <span id="drilldown-window-tag" class="flex flex-wrap items-center justify-end gap-1.5">24-Hour Evaluation Window</span>
           </div>
         </div>
 
@@ -1652,22 +1875,28 @@ PORTAL_HTML = """
     let selectedVehicleName = null;
     let isDetailView = false;
     let refitDone = false;
-    let timelineLoadedFor = null;
+    let selectedViolation = null;    // the violation the telemetry stream is scoped to (null = live last 24h)
+    let detailViolations = [];       // the rows currently rendered in the inspection violations table
+    let timelineRows = [];           // the stream as fetched, newest first (the engine's own order)
+    let timelineOrder = 'asc';       // 'asc' reads the drive run forwards, from its start down to the alert
+    let timelineLoadedFor = null;    // window key already in the timeline table, so re-opening it is free
 
     let VIOLATION_TYPES = [];
+    // Each type's hue says what kind of violation it is: reds and amber for speed, plum for fatigue,
+    // steel blue for night, and teal / brown / charcoal for the three seat-belt rules
     const TYPE_META = {
-      FATIGUE_DRIVING: { icon: 'fa-hourglass-half', cls: 'bg-[#632024]/40 text-[#FFCCD0] border-[#E25763]/70' },
-      NIGHT_DRIVING: { icon: 'fa-moon', cls: 'bg-[#25344F] text-[#EBD2B2] border-[#EBD2B2]/40' },
-      OVERSPEED_HIGHWAY: { icon: 'fa-road', cls: 'bg-[#6F4D38]/40 text-[#FBE6D6] border-[#E49767]/70' },
-      OVERSPEED_MOTORWAY: { icon: 'fa-road', cls: 'bg-[#632024]/50 text-[#FFCCD0] border-[#E25763]/80' },
-      SEAT_BELT_IGNITION_OFF: { icon: 'fa-user-shield', cls: 'bg-[#25344F]/70 text-[#C5DDF5] border-[#7C95B1]/50' },
-      SEAT_BELT_DISCONNECTED: { icon: 'fa-user-slash', cls: 'bg-[#6F4D38]/40 text-[#FBE6D6] border-[#D5B893]/60' },
-      DELAY_DRIVER_SEAT_BELT: { icon: 'fa-user-clock', cls: 'bg-[#1E2D42] text-[#9EC5E8] border-[#9EC5E8]/40' },
-      OVERSPEED: { icon: 'fa-gauge-high', cls: 'bg-[#632024]/60 text-[#FFCCD0] border-[#E25763]' }
+      FATIGUE_DRIVING:        { icon: 'fa-hourglass-half', cls: 'bg-plum-soft text-plum border-plum/30',            on: 'bg-plum text-ice border-plum',               ic: 'text-plum' },
+      NIGHT_DRIVING:          { icon: 'fa-moon',           cls: 'bg-info-soft text-info border-info/30',            on: 'bg-info text-ice border-info',               ic: 'text-info' },
+      OVERSPEED_HIGHWAY:      { icon: 'fa-road',           cls: 'bg-warn-soft text-warn-deep border-warn/35',       on: 'bg-warn text-ice-lt border-warn',            ic: 'text-warn' },
+      OVERSPEED_MOTORWAY:     { icon: 'fa-road',           cls: 'bg-danger-soft text-danger-deep border-danger/40', on: 'bg-danger-deep text-ice border-danger-deep', ic: 'text-danger-deep' },
+      SEAT_BELT_IGNITION_OFF: { icon: 'fa-user-shield',    cls: 'bg-slate-soft text-slate border-slate/30',         on: 'bg-slate text-ice border-slate',             ic: 'text-slate' },
+      SEAT_BELT_DISCONNECTED: { icon: 'fa-user-slash',     cls: 'bg-teal-soft text-teal border-teal/30',            on: 'bg-teal text-ice-lt border-teal',            ic: 'text-teal' },
+      DELAY_DRIVER_SEAT_BELT: { icon: 'fa-user-clock',     cls: 'bg-coffee-soft text-coffee border-coffee/30',      on: 'bg-coffee text-ice-lt border-coffee',        ic: 'text-coffee' },
+      OVERSPEED:              { icon: 'fa-gauge-high',     cls: 'bg-danger-soft text-danger border-danger/35',      on: 'bg-danger text-ice border-danger',           ic: 'text-danger' }
     };
     const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const PRESET_LABELS = { '1D': 'Yesterday', '7D': 'Last 7 days', '15D': 'Last 15 days', '30D': 'Last 30 days' };
-    const LOADER_ROW = (cols, text) => `<tr><td colspan="${cols}" class="p-0 text-center"><div class="glow-loader-wrapper"><div class="glow-loader-container"></div></div>${text ? `<p class="text-sm text-[#C5DDF5] pb-6">${esc(text)}</p>` : ''}</td></tr>`;
+    const LOADER_ROW = (cols, text) => `<tr><td colspan="${cols}" class="p-0 text-center"><div class="glow-loader-wrapper"><div class="glow-loader-container"></div></div>${text ? `<p class="text-sm text-ink2 pb-6">${esc(text)}</p>` : ''}</td></tr>`;
 
     function esc(s) {
       return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1701,37 +1930,39 @@ PORTAL_HTML = """
     function periodTag(period) {
       if (period !== 'Night' && period !== 'Day') return '';
       const night = period === 'Night';
-      const cls = night ? 'bg-[#25344F] text-[#EBD2B2] border-[#EBD2B2]/40' : 'bg-[#6F4D38]/40 text-[#FBE6D6] border-[#E49767]/50';
+      const cls = night ? 'bg-info-soft text-info border-info/35' : 'bg-warn-soft text-warn-deep border-warn/40';
       const icon = night ? 'fa-moon' : 'fa-sun';
       return `<span class="ml-1.5 px-1.5 py-0.5 rounded border text-[0.625rem] font-bold align-middle ${cls}"><i class="fa-solid ${icon} mr-1 text-[0.5625rem]"></i>${period}</span>`;
     }
 
     function typeBadge(key, count) {
-      const meta = TYPE_META[key] || { icon: 'fa-triangle-exclamation', cls: 'bg-[#25344F] text-[#C5DDF5] border-[#9EC5E8]/40' };
+      const meta = TYPE_META[key] || { icon: 'fa-triangle-exclamation', cls: 'bg-slate-soft text-slate border-slate/30' };
       const suffix = count > 1 ? ` ×${count}` : '';
       return `<span class="px-2.5 py-1 rounded-full text-xs font-bold border ${meta.cls} inline-flex items-center gap-1.5 max-w-full" data-tip="${esc(typeLabel(key))}"><i class="fa-solid ${meta.icon} text-[0.6875rem]"></i><span class="truncate">${esc(typeLabel(key))}${suffix}</span></span>`;
     }
 
-    const chip = (on, text) => `<span class="inline-flex items-center px-2 py-0.5 rounded font-mono font-semibold text-xs ${on ? 'bg-[#25344F] text-[#EBD2B2] border border-[#EBD2B2]/50' : 'bg-[#0B1019] text-[#7C95B1] border border-[#25344F]'}">${text}</span>`;
+    // A small reading: tinted in its own hue when it is "on" (moving, ignition on), plain grey when not
+    const CHIP_TONES = { warn: 'bg-warn-soft text-warn-deep border border-warn/40', ok: 'bg-ok-soft text-ok-deep border border-ok/40' };
+    const chip = (on, text, tone) => `<span class="inline-flex items-center px-2 py-0.5 rounded font-mono font-semibold text-xs ${on ? CHIP_TONES[tone] : 'bg-rail text-ink3 border border-edge'}">${text}</span>`;
 
     // The violation's own speed (what Wialon recorded with the alert, or the speed at the fatigue mark),
     // else the telemetry message recorded at the violation: the same speed the dashboard uses
     function speedCell(v) {
       const tel = v.telemetry;
       const speed = v.speed_kmh != null ? v.speed_kmh : (tel ? tel.speed_kmh : null);
-      if (speed == null) return '<span class="text-[#7C95B1]">-</span>';
+      if (speed == null) return '<span class="text-ink3">-</span>';
       const source = v.speed_kmh != null ? 'Speed recorded with the violation' : `Telemetry message at ${tel.time} PKT`;
-      return `<span data-tip="${esc(source)}">${chip(speed > 0, `<i class="fa-solid fa-gauge-high text-[0.5625rem] mr-1 text-[#EBD2B2]"></i>${speed} km/h`)}</span>`;
+      return `<span data-tip="${esc(source)}">${chip(speed > 0, `<i class="fa-solid fa-gauge-high text-[0.5625rem] mr-1"></i>${speed} km/h`, 'warn')}</span>`;
     }
 
     // Ignition from the telemetry message recorded at the violation
     function ignitionCell(v) {
       const tel = v.telemetry;
       if (!tel || tel.ignition == null) {
-        return '<span class="text-[#7C95B1] text-xs" data-tip="No telemetry message within 10 minutes before this violation">-</span>';
+        return '<span class="text-ink3 text-xs" data-tip="No telemetry message within 10 minutes before this violation">-</span>';
       }
       const on = tel.ignition === 1;
-      return `<span data-tip="Telemetry message at ${esc(tel.time)} PKT">${chip(on, on ? 'ON' : 'OFF')}</span>`;
+      return `<span data-tip="Telemetry message at ${esc(tel.time)} PKT">${chip(on, on ? 'ON' : 'OFF', 'ok')}</span>`;
     }
 
     // One styled tooltip for anything carrying data-tip
@@ -1784,14 +2015,14 @@ PORTAL_HTML = """
       if (!container) return;
       const toast = document.createElement('div');
       const isCrit = type === 'critical';
-      toast.className = `p-3.5 rounded-xl border shadow-2xl transition transform flex items-start gap-3 backdrop-blur ${isCrit ? 'bg-[#632024]/95 border-[#E25763]/80 text-white' : 'bg-[#152030]/98 border-[#EBD2B2]/50 text-[#FFFFFF]'}`;
+      toast.className = `p-3.5 rounded-xl border shadow-2xl transition transform flex items-start gap-3 backdrop-blur ${isCrit ? 'bg-danger/95 border-danger/80 text-white' : 'bg-card border-accent/50 text-ink'}`;
       toast.innerHTML = `
-        <i class="fa-solid ${isCrit ? 'fa-triangle-exclamation text-[#FFCCD0]' : 'fa-circle-info text-[#EBD2B2]'} mt-0.5 text-sm"></i>
+        <i class="fa-solid ${isCrit ? 'fa-triangle-exclamation text-danger' : 'fa-circle-info text-accent-deep'} mt-0.5 text-sm"></i>
         <div class="flex-1 text-xs">
-          <div class="font-bold text-xs leading-tight"><span class="${isCrit ? 'text-[#FFCCD0]' : 'text-[#EBD2B2]'}">${esc(title)}</span></div>
-          <p class="mt-1 text-[#C5DDF5] font-medium">${esc(msg)}</p>
+          <div class="font-bold text-xs leading-tight"><span class="${isCrit ? 'text-danger' : 'text-accent-deep'}">${esc(title)}</span></div>
+          <p class="mt-1 text-ink2 font-medium">${esc(msg)}</p>
         </div>
-        <button onclick="this.parentElement.remove()" class="text-[#C5DDF5] hover:text-white text-sm ml-1 leading-none">&times;</button>
+        <button onclick="this.parentElement.remove()" class="opacity-60 hover:opacity-100 text-sm ml-1 leading-none">&times;</button>
       `;
       container.appendChild(toast);
       setTimeout(() => { if (toast.parentElement) toast.remove(); }, 6000);
@@ -1819,7 +2050,7 @@ PORTAL_HTML = """
     function setPeriodButtons() {
       document.querySelectorAll('[data-preset]').forEach(btn => {
         const active = btn.dataset.preset === currentPreset;
-        btn.className = `px-3.5 py-1.5 rounded-lg text-sm font-bold transition ${active ? 'bg-gradient-to-r from-[#6F4D38] to-[#632024] text-white shadow-sm border border-[#EBD2B2]/30' : 'text-[#C5DDF5] hover:text-white'}`;
+        btn.className = `px-3.5 py-1.5 rounded-lg text-sm font-bold transition ${active ? 'bg-brand text-ice shadow-sm border border-brand' : 'text-ink2 hover:text-ink'}`;
       });
     }
 
@@ -1866,6 +2097,14 @@ PORTAL_HTML = """
       refitDone = false;
       populateTypeFilter();
       renderReport();
+      updatePendingBadge();
+      if (pendingDeepLink) {
+        const link = pendingDeepLink;
+        pendingDeepLink = null;
+        Review.show({ plate: link.plate, focusKey: link.focus });
+        return;
+      }
+      if (Review.open) Review.show({});   // a period switch re-stocks the open workbench
     }
 
     async function loadReport(preset) {
@@ -1952,18 +2191,18 @@ PORTAL_HTML = """
       const byType = isDetailView ? ((inspected || {}).violation_counts || {}) : (currentReport ? currentReport.summary.by_type : {});
       const hint = isDetailView ? `click to show only these for ${selectedVehicleName || 'this vehicle'}` : 'click to filter the table';
       container.innerHTML = VIOLATION_TYPES.map(t => {
-        const meta = TYPE_META[t.key] || { icon: 'fa-triangle-exclamation', cls: 'bg-[#25344F] text-[#C5DDF5] border-[#9EC5E8]/40' };
+        const meta = TYPE_META[t.key] || { icon: 'fa-triangle-exclamation', cls: 'bg-slate-soft text-slate border-slate/30', on: 'bg-slate text-ice border-slate', ic: 'text-slate' };
         const count = (byType || {})[t.key] || 0;
         const active = isDetailView ? detailType === t.key : currentStatus === t.key;
         return `
-          <button onclick="toggleTypeFilter('${t.key}')" data-tip="${esc(t.label)} - ${esc(t.description || '')} (${hint})" class="text-left bg-[#152030]/90 ${active ? 'ring-2 ring-[#EBD2B2]/60 bg-[#1E2E44]' : 'hover:bg-[#1A2738]'} rounded-2xl px-4 py-4 transition flex items-center min-w-0 shadow-lg shadow-black/30">
-            <span class="flex items-center gap-3 min-w-0">
-              <span class="w-11 h-11 rounded-xl border ${meta.cls} flex items-center justify-center flex-shrink-0"><i class="fa-solid ${meta.icon} text-lg"></i></span>
-              <span class="min-w-0">
-                <span class="text-sm text-[#FFFFFF] font-bold block leading-tight">${esc(t.label)}</span>
-                <strong class="text-3xl font-extrabold font-mono leading-none mt-1 block ${count > 0 ? 'text-[#EBD2B2]' : 'text-[#7C95B1]'}">${count}</strong>
-              </span>
+          <button onclick="toggleTypeFilter('${t.key}')" data-tip="${esc(t.label)} - ${esc(t.description || '')} (${hint})"
+            class="inline-flex items-center gap-1.5 pl-2 pr-2.5 py-1.5 rounded-full border text-xs font-bold transition min-w-0 shadow-sm
+                   ${active ? meta.on + ' shadow' : 'bg-card border-edge text-ink hover:bg-hover hover:border-edge2'}">
+            <span class="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 ${active ? 'bg-white/20' : meta.cls.split(' ')[0]}">
+              <i class="fa-solid ${meta.icon} text-[0.625rem] ${active ? '' : meta.ic}"></i>
             </span>
+            <span class="truncate">${esc(t.label)}</span>
+            <span class="font-mono font-extrabold ${active ? '' : (count > 0 ? 'text-danger' : 'text-ink3')}">${count}</span>
           </button>
         `;
       }).join('');
@@ -2056,16 +2295,16 @@ PORTAL_HTML = """
       if (items.length === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="4" class="px-6 py-12 text-center text-[#C5DDF5]">
-              <i class="fa-solid fa-circle-check text-[#EBD2B2] text-2xl mb-2 block"></i>
-              <strong class="text-white text-sm">No violations in this report</strong>
-              <p class="text-xs text-[#9EC5E8] mt-1">Nothing matches the selected type or search in ${esc(currentReport.label.toLowerCase())}.</p>
+            <td colspan="4" class="px-6 py-12 text-center text-ink2">
+              <i class="fa-solid fa-circle-check text-ok text-2xl mb-2 block"></i>
+              <strong class="text-ink text-sm">No violations in this report</strong>
+              <p class="text-xs text-ink2 mt-1">Nothing matches the selected type or search in ${esc(currentReport.label.toLowerCase())}.</p>
             </td>
           </tr>`;
       } else {
         items.forEach(v => {
           const tr = document.createElement('tr');
-          tr.className = 'data-row hover:bg-[#1E2E44] cursor-pointer transition';
+          tr.className = 'data-row hover:bg-hover cursor-pointer transition';
           tr.dataset.id = v.id;
           tr.dataset.name = v.vehicle;
           tr.onclick = () => slideToDetail(v.id, v.vehicle);
@@ -2074,17 +2313,17 @@ PORTAL_HTML = """
             .filter(t => counts[t.key] && (currentStatus === 'ALL' || t.key === currentStatus))
             .map(t => typeBadge(t.key, counts[t.key])).join('');
           tr.innerHTML = `
-            <td class="px-4 py-3 font-bold text-white font-mono truncate text-center text-base">
-              <span class="inline-block w-2 h-2 rounded-full mr-1.5 bg-[#EBD2B2] shadow-sm shadow-[#EBD2B2]/50"></span>${esc(v.vehicle)}
+            <td class="px-4 py-3 font-bold text-ink font-mono truncate text-center text-base">
+              <span class="inline-block w-2 h-2 rounded-full mr-1.5 bg-brand ring-2 ring-brand-soft"></span>${esc(v.vehicle)}
             </td>
-            <td class="px-3 py-3 truncate text-center text-[#F4F7FB] font-semibold" data-tip="Driver assigned in Wialon: ${esc(v.driver || 'Unassigned')}">
-              <i class="fa-solid fa-id-badge text-[#9EC5E8] text-sm mr-1.5"></i>${esc(v.driver || 'Unassigned')}
+            <td class="px-3 py-3 truncate text-center text-ink font-semibold" data-tip="Driver assigned in Wialon: ${esc(v.driver || 'Unassigned')}">
+              <i class="fa-solid fa-id-badge text-ink2 text-sm mr-1.5"></i>${esc(v.driver || 'Unassigned')}
             </td>
             <td class="px-3 py-3 text-center">
               <div class="flex flex-wrap items-center justify-center gap-1.5">${badges}</div>
             </td>
             <td class="px-3 py-3 text-center">
-              <button onclick="event.stopPropagation(); const r = this.closest('tr'); slideToDetail(r.dataset.id, r.dataset.name)" class="px-4 py-1.5 bg-gradient-to-r from-[#6F4D38] to-[#632024] hover:brightness-110 text-white rounded-lg text-sm font-semibold shadow-md border border-[#EBD2B2]/30 transition">Inspect</button>
+              <button onclick="event.stopPropagation(); const r = this.closest('tr'); slideToDetail(r.dataset.id, r.dataset.name)" class="px-4 py-1.5 bg-brand hover:bg-brand-deep text-ice rounded-lg text-sm font-semibold shadow-sm border border-brand transition">Inspect</button>
             </td>`;
           tbody.appendChild(tr);
         });
@@ -2106,12 +2345,12 @@ PORTAL_HTML = """
       const c = document.getElementById('pagination-controls');
       if (!c) return;
       const btn = (target, text, disabled) => disabled
-        ? `<button disabled class="opacity-40 cursor-not-allowed px-3 py-1.5 bg-[#152030] rounded-lg text-sm text-[#7C95B1]">${text}</button>`
-        : `<button onclick="changePaginationPage(${target})" class="px-3 py-1.5 bg-[#152030] border border-[#9EC5E8]/35 rounded-lg hover:bg-[#25344F] transition text-sm text-white">${text}</button>`;
+        ? `<button disabled class="opacity-40 cursor-not-allowed px-3 py-1.5 bg-card rounded-lg text-sm text-ink3">${text}</button>`
+        : `<button onclick="changePaginationPage(${target})" class="px-3 py-1.5 bg-card border border-edge rounded-lg hover:bg-rail transition text-sm text-ink">${text}</button>`;
       c.innerHTML = `
         ${btn(1, '« First', page <= 1)}
         ${btn(page - 1, '‹ Prev', page <= 1)}
-        <span class="px-2 text-sm font-medium">Page <strong class="text-white">${page}</strong> of ${totalPages}</span>
+        <span class="px-2 text-sm font-medium">Page <strong class="text-ink">${page}</strong> of ${totalPages}</span>
         ${btn(page + 1, 'Next ›', page >= totalPages)}
         ${btn(totalPages, 'Last »', page >= totalPages)}`;
     }
@@ -2159,15 +2398,34 @@ PORTAL_HTML = """
       return currentReport.vehicles.find(v => String(v.id) === String(vehicleId)) || null;
     }
 
+    // The telemetry span a violation was raised on, padded either side (TELEMETRY_PAD_SEC in
+    // fleet_violations.py). Fatigue Driving fires at the END of the continuous drive run, so the run's
+    // start is derived from it; a Wialon notification alert is a single instant.
+    const TELEMETRY_PAD_SEC = 300;
+    function telemetryWindow(v) {
+      const run = (v.type === 'FATIGUE_DRIVING' && v.continuous_drive_minutes)
+        ? Math.round(v.continuous_drive_minutes * 60) : 0;
+      return { from: Math.round(v.time_unix) - run - TELEMETRY_PAD_SEC,
+               to: Math.round(v.time_unix) + TELEMETRY_PAD_SEC, run };
+    }
+
+    // The clock time of an epoch second in PKT, matching the times the backend formats
+    function pktClock(epoch) {
+      const d = new Date((epoch + 5 * 3600) * 1000);
+      return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+    }
+
     function slideToDetail(vehicleId, vehicleName) {
       selectedVehicleId = vehicleId;
       selectedVehicleName = vehicleName;
       isDetailView = true;
+      selectedViolation = null;
+      timelineRows = [];
       timelineLoadedFor = null;
       detailType = currentStatus === 'ALL' ? null : currentStatus;
 
       const title = document.getElementById('drilldown-title');
-      if (title) title.innerHTML = `<span>Vehicle Inspection:</span> <span class="font-mono text-[#EBD2B2] font-bold">${esc(vehicleName)}</span>`;
+      if (title) title.innerHTML = `<span>Vehicle Inspection:</span> <span class="font-mono text-accent-deep font-bold">${esc(vehicleName)}</span>`;
       document.getElementById('view-primary').classList.add('hidden');
       document.getElementById('view-detail').classList.remove('hidden');
       setDetailSubView('violations');
@@ -2179,6 +2437,7 @@ PORTAL_HTML = """
       isDetailView = false;
       selectedVehicleId = null;
       selectedVehicleName = null;
+      selectedViolation = null;
       document.getElementById('view-detail').classList.add('hidden');
       document.getElementById('view-primary').classList.remove('hidden');
       if ((detailType || 'ALL') !== currentStatus) {
@@ -2196,41 +2455,59 @@ PORTAL_HTML = """
     // A verdict belongs to vehicle + type + second: the key that survives the nightly recalculation
     function reviewKey(v) { return `${v.vehicle_id}|${v.type}|${v.time_unix}`; }
 
-    function reviewButtons(v) {
-      const key = reviewKey(v);
-      const button = (verdict, label, onCls) => {
-        const on = v.verdict === verdict;
-        return `<button onclick="setReview('${key}', '${verdict}')" data-tip="${on ? 'Click again to clear' : 'Mark as ' + label}"
-          class="px-2 py-1 rounded-md text-[0.6875rem] font-bold border transition ${on ? onCls : 'bg-[#0B1019] text-[#7C95B1] border-[#7C95B1]/40 hover:text-white hover:border-[#EBD2B2]'}">${label}</button>`;
-      };
-      return `<div class="flex items-center justify-center gap-1">
-        ${button('GENUINE', 'Genuine', 'bg-[#EBD2B2]/20 text-[#EBD2B2] border-[#EBD2B2]')}
-        ${button('FALSE', 'False', 'bg-[#632024]/60 text-[#FFCCD0] border-[#E25763]')}
-      </div>`;
+    // Setting a verdict happens only in the review workbench; everywhere else just shows the result
+    function verdictChip(v) {
+      const meta = v.verdict === 'GENUINE' ? ['Genuine', 'bg-ok-soft text-ok-deep border-ok']
+                 : v.verdict === 'FALSE'   ? ['False', 'bg-danger-soft text-danger border-danger']
+                 : ['Pending', 'bg-rail text-ink3 border-edge2'];
+      return `<span class="inline-flex px-2 py-0.5 rounded-full text-[0.6875rem] font-bold border ${meta[1]}"
+        data-tip="Set in the Review workbench, from the Review button in the header">${meta[0]}</span>`;
     }
 
-    // Clicking the verdict a violation already has clears it back to pending
-    async function setReview(key, verdict) {
-      const matches = [];
-      new Set(Object.values(reportCache).concat(currentReport ? [currentReport] : [])).forEach(rep =>
-        rep.vehicles.forEach(item => item.violations.forEach(v => { if (reviewKey(v) === key) matches.push(v); })));
-      if (!matches.length) return;
-      const next = matches[0].verdict === verdict ? null : verdict;
-      const [vehicleId, type, timeUnix] = key.split('|');
-      try {
-        const res = await fetch('/api/review', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vehicle_id: Number(vehicleId), type, time_unix: Number(timeUnix), verdict: next })
-        });
-        const data = await res.json();
-        if (!res.ok || data.status !== 'success') throw new Error(data.message || 'Could not save the review');
-        matches.forEach(v => { v.verdict = next; });
-        if (VERDICTS) { if (next) VERDICTS[key] = next; else delete VERDICTS[key]; }
-        renderVehicleViolations();
-      } catch (e) {
-        showToast('Review not saved', e.message, 'critical');
-      }
+""" + review_modal.SCRIPT + """
+    // ---------------------------------------------------------------- review workbench
+    // The modal itself lives in review_modal.py, shared with the dashboard. This is the portal's
+    // adapter: its violations come from the report already in the browser, so opening is instant.
+    let pendingDeepLink = null;    // ?review=/?focus= held until the report it needs has loaded
+
+    function allReportViolations() {
+      if (!currentReport) return [];
+      const out = [];
+      currentReport.vehicles.forEach(item => item.violations.forEach(v => out.push(v)));
+      return out;
     }
+
+    function pendingCount() {
+      return allReportViolations().filter(v => !v.verdict).length;
+    }
+
+    function updatePendingBadge() {
+      const badge = document.getElementById('review-pending-badge');
+      if (!badge) return;
+      const n = pendingCount();
+      badge.textContent = n > 999 ? '999+' : n;
+      badge.classList.toggle('hidden', !currentReport || n === 0);
+    }
+
+    Review.host = {
+      esc,
+      typeLabel,
+      typeBadge: key => typeBadge(key, 1),
+      toast: (title, message) => showToast(title, message, 'critical'),
+      violations: ctx => ctx.plate
+        ? allReportViolations().filter(v => v.vehicle === ctx.plate)
+        : allReportViolations(),
+      period: () => currentReport
+        ? { label: currentReport.label, from: currentReport.from, to: currentReport.to } : {},
+      // the verdict is already on the shared record, so the rest of the page only needs redrawing
+      onVerdict: () => { renderVehicleViolations(); updatePendingBadge(); },
+    };
+
+    function openReviewModal() {
+      if (!currentReport) { showToast('No report loaded', 'Build or load a report first.', 'info'); return; }
+      Review.show({});
+    }
+
 
     function renderVehicleViolations() {
       const vBody = document.getElementById('drilldown-violations-body');
@@ -2238,39 +2515,50 @@ PORTAL_HTML = """
       const all = vehicle ? vehicle.violations : [];
       const violations = detailType ? all.filter(v => v.type === detailType) : all;
       document.getElementById('detail-violations-count').innerText =
-        detailType ? `${violations.length} of ${all.length}, ${typeLabel(detailType)} only` : all.length;
-      document.getElementById('drilldown-window-tag').innerText =
-        `${currentReport.label}: ${currentReport.from} to ${currentReport.to} PKT`;
+        detailType ? `${violations.length} of ${all.length} · ${typeLabel(detailType)}` : all.length;
+      showReportWindow();
       if (!vBody) return;
       if (violations.length === 0) {
-        vBody.innerHTML = `<tr><td colspan="8" class="px-6 py-12 text-center text-[#C5DDF5]">
-            <i class="fa-solid fa-circle-check text-[#EBD2B2] text-2xl mb-2 block"></i>
-            <strong class="text-white text-sm">${detailType ? `No ${esc(typeLabel(detailType))} violations` : 'No Violations Recorded'}</strong>
-            <p class="text-xs text-[#9EC5E8] mt-1">${detailType ? 'Click the highlighted card again to show every type.' : 'This vehicle has no violations of the monitored types in this period.'}</p>
+        vBody.innerHTML = `<tr><td colspan="8" class="px-6 py-12 text-center text-ink2">
+            <i class="fa-solid fa-circle-check text-ok text-2xl mb-2 block"></i>
+            <strong class="text-ink text-sm">${detailType ? `No ${esc(typeLabel(detailType))} violations` : 'No Violations Recorded'}</strong>
+            <p class="text-xs text-ink2 mt-1">${detailType ? 'Click the highlighted card again to show every type.' : 'This vehicle has no violations of the monitored types in this period.'}</p>
           </td></tr>`;
         return;
       }
-      vBody.innerHTML = violations.map(v => {
+      detailViolations = violations;
+      vBody.innerHTML = violations.map((v, i) => {
         const mins = v.continuous_drive_minutes;
         // Night runs on a shorter limit than day, so the duration alone does not say whether it broke it
 
         const warn = v.text_names_other_unit
-          ? '<i class="fa-solid fa-triangle-exclamation text-[#E25763] mr-1" data-tip="The Wialon text for this alert names a different vehicle"></i>'
+          ? '<i class="fa-solid fa-triangle-exclamation text-danger mr-1" data-tip="The Wialon text for this alert names a different vehicle"></i>'
           : '';
+        const on = selectedViolation && reviewKey(selectedViolation) === reviewKey(v);
+        const w = telemetryWindow(v);
         return `
-          <tr class="hover:bg-[#1E2E44] transition">
-            <td class="px-3 py-3 font-mono text-sm text-[#FFFFFF] text-center">${esc(v.time)}</td>
+          <tr onclick="openViolationTelemetry(${i})" class="cursor-pointer transition ${on ? 'row-sel' : 'hover:bg-hover'}">
+            <td class="px-3 py-3 font-mono text-sm text-ink text-center" data-tip="Click to read the telemetry this alert fired on: ${pktClock(w.from)} to ${pktClock(w.to)} PKT">${esc(v.time)}</td>
             <td class="px-3 py-3 text-center">${typeBadge(v.type, 1)}</td>
             <td class="px-2 py-3 text-center">${speedCell(v)}</td>
             <td class="px-2 py-3 text-center">${ignitionCell(v)}</td>
-            <td class="px-2 py-3 text-center font-mono font-bold text-[#FFFFFF]" data-tip="${v.period === 'Night' ? 'Night limit, 22:00-06:00 PKT' : (v.period === 'Day' ? 'Day limit, 06:00-22:00 PKT' : '')}">${mins ? driveHours(mins) + periodTag(v.period) : '-'}</td>
-            <td class="px-3 py-3 text-[#FFFFFF] font-medium text-sm truncate text-center" data-tip="${esc(v.location)} (${v.lat}, ${v.lon})">
-              <i class="fa-solid fa-location-dot text-[#EBD2B2] mr-1 text-[0.625rem]"></i>${esc(v.location)}
+            <td class="px-2 py-3 text-center font-mono font-bold text-ink" data-tip="${v.period === 'Night' ? 'Night limit, 22:00-06:00 PKT' : (v.period === 'Day' ? 'Day limit, 06:00-22:00 PKT' : '')}">${mins ? driveHours(mins) + periodTag(v.period) : '-'}</td>
+            <td class="px-3 py-3 text-ink font-medium text-sm truncate text-center" data-tip="${esc(v.location)} (${v.lat}, ${v.lon})">
+              <i class="fa-solid fa-location-dot text-accent-deep mr-1 text-[0.625rem]"></i>${esc(v.location)}
             </td>
-            <td class="px-3 py-3 text-[#C5DDF5] text-xs truncate" data-tip="${esc(v.details)}">${warn}${esc(detailsText(v))}</td>
-            <td class="px-2 py-3 text-center">${reviewButtons(v)}</td>
+            <td class="px-3 py-3 text-ink2 text-xs truncate" data-tip="${esc(v.details)}">${warn}${esc(detailsText(v))}</td>
+            <td class="px-2 py-3 text-center">${verdictChip(v)}</td>
           </tr>`;
       }).join('');
+    }
+
+    // A violation row opens the stream for the span that alert was raised on
+    function openViolationTelemetry(index) {
+      const v = detailViolations[index];
+      if (!v) return;
+      selectedViolation = v;
+      renderVehicleViolations();     // move the selected-row marker
+      setDetailSubView('timeline');
     }
 
     function setDetailSubView(view) {
@@ -2278,67 +2566,179 @@ PORTAL_HTML = """
       const btnTime = document.getElementById('btn-sub-timeline');
       const secVio = document.getElementById('drilldown-violations-section');
       const secTime = document.getElementById('drilldown-timeline-section');
-      const active = 'px-3 py-1.5 rounded-lg text-sm font-bold transition text-white shadow-sm flex items-center gap-1.5 ';
-      const idle = 'px-3 py-1.5 rounded-lg text-sm font-bold transition text-[#C5DDF5] hover:text-white flex items-center gap-1.5';
+      btnVio.classList.toggle('on', view === 'violations');
+      btnTime.classList.toggle('on', view !== 'violations');
       if (view === 'violations') {
-        btnVio.className = active + 'bg-gradient-to-r from-[#6F4D38] to-[#632024] border border-[#EBD2B2]/30';
-        btnTime.className = idle;
         secVio.classList.remove('hidden');
         secTime.classList.add('hidden');
+        ['btn-timeline-order', 'btn-timeline-excel'].forEach(id => {
+          const b = document.getElementById(id);
+          if (b) { b.classList.add('hidden'); b.classList.remove('flex'); }
+        });
+        showReportWindow();
       } else {
-        btnVio.className = idle;
-        btnTime.className = active + 'bg-[#25344F] border border-[#EBD2B2]/40';
         secVio.classList.add('hidden');
         secTime.classList.remove('hidden');
-        if (timelineLoadedFor !== selectedVehicleId) fetchTelemetryStream();
+        // opened from the tab rather than a row: show the newest violation's span
+        if (!selectedViolation && detailViolations.length) selectedViolation = detailViolations[0];
+        setTimelineLabels();
+        if (timelineLoadedFor !== timelineKey()) fetchTelemetryStream();
       }
     }
 
-    // The telemetry stream is always the vehicle's live last 24 hours, whatever period the report covers
+    function timelineKey() {
+      const w = selectedViolation ? telemetryWindow(selectedViolation) : null;
+      return `${selectedVehicleId}|${w ? w.from : 'live'}|${w ? w.to : 'live'}`;
+    }
+
+    const windowChip = (icon, text, tip) =>
+      `<span class="window-chip"${tip ? ` data-tip="${esc(tip)}"` : ''}><i class="fa-solid ${icon}"></i>${esc(text)}</span>`;
+
+    // The footer strip while the violations list is showing: the report it belongs to
+    function showReportWindow() {
+      const tag = document.getElementById('drilldown-window-tag');
+      if (!tag || !currentReport) return;
+      tag.innerHTML = windowChip('fa-calendar-days', `${currentReport.label}: ${currentReport.from} to ${currentReport.to} PKT`);
+    }
+
+    // What the stream is showing, in the tab label and the footer strip
+    function setTimelineLabels() {
+      const v = selectedViolation;
+      const w = v ? telemetryWindow(v) : null;
+      const scopeTag = document.getElementById('detail-timeline-scope');
+      const windowTag = document.getElementById('drilldown-window-tag');
+      if (scopeTag) scopeTag.innerText = w ? `· ${pktClock(w.from)}–${pktClock(w.to)}` : '· last 24h';
+      if (!windowTag) return;
+      windowTag.innerHTML = w
+        ? typeBadge(v.type, 1) +
+          windowChip('fa-bolt', `at ${v.time.slice(11)}`, 'When the alert was raised') +
+          (w.run ? windowChip('fa-hourglass-half', `${driveHours(v.continuous_drive_minutes)} drive run`, 'The continuous drive the alert was raised on') : '') +
+          windowChip('fa-clock', `${pktClock(w.from)} → ${pktClock(w.to)} PKT`, 'The telemetry shown in the stream')
+        : windowChip('fa-satellite-dish', 'Live telemetry: the last 24 hours');
+    }
+
+    // The stream covers the span the selected violation fired on; with no violation to scope it to
+    // (a vehicle with a clean sheet) it falls back to the vehicle's live last 24 hours.
     async function fetchTelemetryStream(forceRefresh = false) {
       if (!selectedVehicleId) return;
       const tBody = document.getElementById('timeline-table-body');
       const refIcon = document.getElementById('btn-inspect-refresh-icon');
+      const v = selectedViolation;
+      const w = v ? telemetryWindow(v) : null;
+      const key = timelineKey();
+      const span = w ? `${pktClock(w.from)} to ${pktClock(w.to)} PKT` : 'the last 24 hours';
+
       if (refIcon) refIcon.classList.add('fa-spin');
-      if (tBody) tBody.innerHTML = LOADER_ROW(6, 'Reading the last 24 hours of telemetry from Wialon...');
+      setTimelineLabels();
+      if (tBody) tBody.innerHTML = LOADER_ROW(6, `Reading ${span} of telemetry from Wialon...`);
       try {
-        const url = `/api/vehicle-report?vehicleId=${encodeURIComponent(selectedVehicleId)}&vehicleName=${encodeURIComponent(selectedVehicleName)}&bypass_cache=${forceRefresh ? 1 : 0}`;
+        let url = `/api/vehicle-report?vehicleId=${encodeURIComponent(selectedVehicleId)}&vehicleName=${encodeURIComponent(selectedVehicleName)}&bypass_cache=${forceRefresh ? 1 : 0}`;
+        if (w) url += `&from=${w.from}&to=${w.to}`;
         const res = await fetch(url);
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Could not load telemetry');
-        const timeline = data.timeline || [];
-        timelineLoadedFor = selectedVehicleId;
-        document.getElementById('detail-packets-count').innerText = timeline.length;
-        if (tBody) {
-          tBody.innerHTML = timeline.length === 0
-            ? '<tr><td colspan="6" class="px-5 py-8 text-center text-[#C5DDF5] font-sans">No telemetry messages in the last 24 hours.</td></tr>'
-            : timeline.map(row => {
-                const isVio = row.status && (row.status.includes('BREACH') || row.status.includes('VIOLATION') || row.status.includes('EXCEEDED'));
-                const spd = row.speed || 0;
-                const ign = row.ignition || 'OFF';
-                return `
-                  <tr class="hover:bg-[#1E2E44] transition">
-                    <td class="px-3 py-2.5 text-center text-[#FFFFFF] font-mono text-sm">${esc(row.time)}</td>
-                    <td class="px-2 py-1.5 text-center">
-                      <div class="flex items-center justify-center gap-1 font-mono text-xs">
-                        <span class="px-1.5 py-0.5 rounded font-bold ${spd > 0 ? 'bg-[#25344F] text-[#EBD2B2] border border-[#EBD2B2]/40' : 'bg-[#0B1019] text-[#7C95B1] border border-[#25344F]'}">${spd} km/h</span>
-                        <span class="px-1.5 py-0.5 rounded font-bold ${ign === 'ON' ? 'bg-[#25344F] text-[#EBD2B2] border border-[#EBD2B2]/40' : 'bg-[#0B1019] text-[#7C95B1] border border-[#25344F]'}">${ign === 'ON' ? 'IGN ON' : 'IGN OFF'}</span>
-                      </div>
-                    </td>
-                    <td class="px-2 py-1.5 text-center font-mono font-bold text-[#FFFFFF]">${esc(row.dwell_rest)}</td>
-                    <td class="px-2 py-1.5 text-center text-xs font-semibold text-[#C5DDF5]">${esc(row.state)}</td>
-                    <td class="px-3 py-1.5 text-[#FFFFFF] font-medium text-xs truncate text-center" data-tip="${esc(row.location)}">${esc(row.location)}</td>
-                    <td class="px-2 py-1.5 text-center text-xs">
-                      <span class="px-2 py-0.5 rounded text-[0.625rem] font-bold ${isVio ? 'bg-[#632024] text-[#FFCCD0] border border-[#E25763]' : 'bg-[#25344F] text-[#C5DDF5] border border-[#9EC5E8]/30'}">${isVio ? 'VIOLATION' : 'Normal'}</span>
-                    </td>
-                  </tr>`;
-              }).join('');
-        }
+        timelineRows = data.timeline || [];      // as the engine returns them: newest first
+        timelineLoadedFor = key;
+        document.getElementById('detail-packets-count').innerText = timelineRows.length;
+        renderTimeline();
       } catch (e) {
-        if (tBody) tBody.innerHTML = `<tr><td colspan="6" class="px-5 py-8 text-center text-[#E25763]">${esc(e.message)}</td></tr>`;
+        timelineRows = [];
+        if (tBody) tBody.innerHTML = `<tr><td colspan="6" class="px-5 py-8 text-center text-danger">${esc(e.message)}</td></tr>`;
       } finally {
         if (refIcon) refIcon.classList.remove('fa-spin');
       }
+    }
+
+    // Same workbook as the fleet export, with the stream on screen as its rows
+    function telemetryExportUrl() {
+      if (!selectedVehicleId || !timelineRows.length) return null;
+      const v = selectedViolation;
+      const w = v ? telemetryWindow(v) : null;
+      let url = `/api/export-telemetry-xlsx?vehicleId=${encodeURIComponent(selectedVehicleId)}` +
+                `&vehicleName=${encodeURIComponent(selectedVehicleName)}&order=${timelineOrder}`;
+      if (w) {
+        url += `&from=${w.from}&to=${w.to}`;
+        // the drive run the alert was raised on, so the sheet can flag what is context either side
+        if (w.run) url += `&runFrom=${Math.round(v.time_unix) - w.run}&runTo=${Math.round(v.time_unix)}`;
+      }
+      return url;
+    }
+
+    function exportTelemetryToExcel() {
+      const url = telemetryExportUrl();
+      if (url) window.location.href = url;
+    }
+
+    function toggleTimelineOrder() {
+      timelineOrder = timelineOrder === 'asc' ? 'desc' : 'asc';
+      renderTimeline();
+    }
+
+    function renderTimeline() {
+      const tBody = document.getElementById('timeline-table-body');
+      const btn = document.getElementById('btn-timeline-order');
+      const v = selectedViolation;
+      const w = v ? telemetryWindow(v) : null;
+      const span = w ? `${pktClock(w.from)} to ${pktClock(w.to)} PKT` : 'the last 24 hours';
+
+      const xls = document.getElementById('btn-timeline-excel');
+      if (xls) {
+        xls.classList.toggle('hidden', !timelineRows.length);
+        xls.classList.toggle('flex', !!timelineRows.length);
+      }
+      if (btn) {
+        btn.classList.toggle('hidden', !timelineRows.length);
+        btn.classList.toggle('flex', !!timelineRows.length);
+        document.getElementById('btn-timeline-order-label').innerText =
+          timelineOrder === 'asc' ? 'Oldest first' : 'Newest first';
+        document.getElementById('btn-timeline-order-icon').className =
+          `fa-solid ${timelineOrder === 'asc' ? 'fa-arrow-down-short-wide' : 'fa-arrow-up-short-wide'} text-[0.625rem]`;
+      }
+      if (!tBody) return;
+      if (!timelineRows.length) {
+        tBody.innerHTML = `<tr><td colspan="6" class="px-5 py-8 text-center text-ink2 font-sans">No telemetry messages in ${esc(span)}.</td></tr>`;
+        return;
+      }
+
+      // The message the alert was raised at, so the trigger row stands out in the stream. One row, not
+      // one second: a tracker can log two messages in the same second (an ignition change is recorded
+      // alongside the regular reading), and both would otherwise be labelled VIOLATION. Ties go to the
+      // first one met in this newest-first list, i.e. the latest reading in that second.
+      const markRow = v ? timelineRows.reduce((best, r) =>
+        (best === null || Math.abs(r.time_unix - v.time_unix) < Math.abs(best.time_unix - v.time_unix)) ? r : best, null) : null;
+      // the run the alert was raised on: everything outside it is the context either side
+      const runFrom = w && w.run ? Math.round(v.time_unix) - w.run : null;
+
+      const rows = timelineOrder === 'asc' ? [...timelineRows].reverse() : timelineRows;
+      tBody.innerHTML = rows.map(row => {
+        const mark = row === markRow;
+        const isVio = (mark && v) || (row.status && (row.status.includes('BREACH') || row.status.includes('VIOLATION') || row.status.includes('EXCEEDED')));
+        const spd = row.speed || 0;
+        const ign = row.ignition || 'OFF';
+        const outside = w && !mark && (runFrom !== null
+          ? (row.time_unix < runFrom || row.time_unix > v.time_unix)
+          : false);
+        const driving = (row.state || '').startsWith('WORK');
+        return `
+          <tr class="transition ${mark ? 'row-mark' : 'hover:bg-hover'} ${outside ? 'opacity-50' : ''}"
+            ${mark ? `data-tip="The message this ${esc(typeLabel(v.type))} alert was raised at"`
+                   : (outside ? 'data-tip="Context either side of the drive run, not part of it"' : '')}>
+            <td class="px-3 py-2.5 text-center text-ink font-mono text-sm">${esc(row.time)}</td>
+            <td class="px-2 py-1.5 text-center">
+              <div class="flex items-center justify-center gap-1 font-mono text-xs">
+                <span class="px-1.5 py-0.5 rounded font-bold ${spd > 0 ? 'bg-warn-soft text-warn-deep border border-warn/40' : 'bg-rail text-ink3 border border-edge'}">${spd} km/h</span>
+                <span class="px-1.5 py-0.5 rounded font-bold ${ign === 'ON' ? 'bg-ok-soft text-ok-deep border border-ok/40' : 'bg-rail text-ink3 border border-edge'}">${ign === 'ON' ? 'IGN ON' : 'IGN OFF'}</span>
+              </div>
+            </td>
+            <td class="px-2 py-1.5 text-center font-mono font-bold text-ink"
+              data-tip="${driving ? 'Driven this long without a 00:05 reset stop' : 'This stop has lasted this long; 00:05 clears the drive timer'}">${esc(row.dwell_rest)}</td>
+            <td class="px-2 py-1.5 text-center text-xs font-semibold text-ink2">${esc(row.state)}</td>
+            <td class="px-3 py-1.5 text-ink font-medium text-xs truncate text-center" data-tip="${esc(row.location)}">${esc(row.location)}</td>
+            <td class="px-2 py-1.5 text-center text-xs">
+              <span class="px-2 py-0.5 rounded text-[0.625rem] font-bold ${isVio ? 'bg-danger text-ice border border-danger' : 'bg-rail text-ink2 border border-edge'}">${isVio ? 'VIOLATION' : 'Normal'}</span>
+            </td>
+          </tr>`;
+      }).join('');
     }
 
     // ---------------------------------------------------------------- export
@@ -2361,14 +2761,14 @@ PORTAL_HTML = """
         const data = await fetch('/api/wialon-limits').then(r => r.json());
         const limits = data.limits || [];
         box.innerHTML = limits.length === 0
-          ? '<span class="text-[#f2a6aa]">Could not read the limits from Wialon.</span>'
+          ? '<span class="text-danger">Could not read the limits from Wialon.</span>'
           : limits.map(l => `
-            <div class="flex items-center justify-between gap-3 bg-[#131b29]/80 border border-[#617891]/40 rounded-lg px-2.5 py-1.5" data-tip="${esc(l.wialon_rule)} - ${esc(l.note)}">
-              <span class="truncate ${l.disabled ? 'text-[#617891] line-through' : 'text-[#F4F7FB]'}">${esc(l.label)}</span>
-              <span class="font-mono font-bold ${l.disabled ? 'text-[#617891]' : 'text-[#D5B893]'} whitespace-nowrap">${esc(l.value)}</span>
+            <div class="flex items-center justify-between gap-3 bg-page border border-edge rounded-lg px-2.5 py-1.5" data-tip="${esc(l.wialon_rule)} - ${esc(l.note)}">
+              <span class="truncate ${l.disabled ? 'text-ink3 line-through' : 'text-ink'}">${esc(l.label)}</span>
+              <span class="font-mono font-bold ${l.disabled ? 'text-ink3' : 'text-accent-deep'} whitespace-nowrap">${esc(l.value)}</span>
             </div>`).join('');
       } catch (e) {
-        box.innerHTML = '<span class="text-[#f2a6aa]">Could not read the limits from Wialon.</span>';
+        box.innerHTML = '<span class="text-danger">Could not read the limits from Wialon.</span>';
       }
     }
 
@@ -2410,8 +2810,15 @@ PORTAL_HTML = """
 
     window.addEventListener('DOMContentLoaded', () => {
       setupTooltips();
-      const askedPreset = (new URLSearchParams(window.location.search).get('preset') || '').toUpperCase();
+      Review.bind();
+      const params = new URLSearchParams(window.location.search);
+      const askedPreset = (params.get('preset') || '').toUpperCase();
       currentPreset = PRESET_LABELS[askedPreset] ? askedPreset : '1D';
+      // a link in from the dashboard; held until showReport() has the period it refers to
+      if (params.get('review')) {
+        pendingDeepLink = { plate: params.get('review'), focus: params.get('focus') || null };
+        history.replaceState(null, '', `/?preset=${currentPreset}`);
+      }
       setPeriodButtons();
       loadReport(currentPreset);
 
@@ -2435,16 +2842,36 @@ PORTAL_HTML = """
 def index():
     return render_template_string(PORTAL_HTML)
 
+
+# The archive starts with the process, not with the first page load. Under waitress there may be no
+# request for hours, and the whole point is that the shortcuts and the alert queue are already warm
+# by the time someone opens the portal: prewarm() fills REPORTS._built, warm_payloads() fills
+# PAYLOAD_CACHE, and the alert worker drains whatever the archive queued. Both calls spawn one daemon
+# thread and are idempotent, so the before_request hook above is now only a fallback.
+#
+# Keep this a single process. _day_lock is a threading lock and drain() has no cross-process claim, so
+# two processes would race on archiving a day and could send an alert twice; both caches are in memory
+# as well, so a second process would serve cold. Waitress is threaded, not forking, which suits this.
+#
+# Werkzeug's reloader imports this module in the parent as well; only the serving child runs the job.
+_RELOADER_PARENT = __name__ == "__main__" and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
+if not _RELOADER_PARENT:
+    REPORTS.start_scheduler()
+    ALERTS.start_worker(fatigue_violations_by_key)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("\n" + "=" * 70)
-    print("  Vehicle Operations & Compliance Portal")
+    print("  Vehicle Operations & Compliance Portal (development server)")
     print(f"  Local URL: http://localhost:{port}")
+    print("  Deployment: waitress-serve --host=127.0.0.1 --port=5000 --threads=8 app:app")
     print("=" * 70 + "\n")
-    # With the debug reloader only the serving child process runs the archive job
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        REPORTS.start_scheduler()
+    # Bound to localhost, not 0.0.0.0: debug=True serves the Werkzeug console, which executes Python on
+    # this machine for anyone who can reach a traceback. Anything outside this box (a tunnel included)
+    # should go through waitress, which has no such console.
+    #
     # "stat" checks only the source files the app has loaded. The default watchdog reloader watches whole
     # folders (Python's own included) and on Windows restarts whenever any Python process writes a cache
     # file there, which killed the archive job mid-day and left the portal unreachable while it wound down.
-    app.run(host="0.0.0.0", port=port, debug=True, reloader_type="stat")
+    app.run(host="127.0.0.1", port=port, debug=True, reloader_type="stat")

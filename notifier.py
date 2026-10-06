@@ -33,6 +33,9 @@ from wialon_alerts import load_env
 TABLE = "portal_fatigue_alerts"
 ALERT_TYPE = "FATIGUE_DRIVING"
 
+MAX_ALERT_AGE_DAYS = 3   # older violations are archived and shown in the portal, but not emailed:
+                         # a portal left closed for a fortnight would otherwise send one mail covering
+                         # every fatigue violation in the 30 days catch_up() fills on the next start.
 MAX_ATTEMPTS = 5      # a row that has failed this often is left alone, so one bad address cannot loop
 BATCH = 200           # rows read per drain; a day of fatigue violations is far below this
 POLL_SEC = 60
@@ -233,7 +236,12 @@ class FatigueAlerter:
     def enqueue(self, violations):
         """Queue one row per (fatigue violation x recipient). Rows already queued or sent are ignored."""
         targets = recipients()
-        fatigue = [v for v in violations if v.get("type") == ALERT_TYPE]
+        cutoff = time.time() - MAX_ALERT_AGE_DAYS * 86400
+        recent = [v for v in violations if v.get("type") == ALERT_TYPE]
+        fatigue = [v for v in recent if int(v["time_unix"]) >= cutoff]
+        if len(recent) != len(fatigue):
+            print("[Alerts] skipped {} fatigue violation(s) older than {} days".format(
+                len(recent) - len(fatigue), MAX_ALERT_AGE_DAYS))
         if not targets or not fatigue:
             return 0
         problem = self.problem()

@@ -58,6 +58,9 @@ TELEMETRY_LOOKAHEAD_SEC = 60    # ...and past it: telling a false stop needs the
 TELEMETRY_BATCH = 40
 CACHE_VERSION = 7   # Driver Seat Belt Disconnected read as a violation type
 ARCHIVE_DAYS = 30             # whole days the archive keeps complete: the longest shortcut
+PRUNE_KEEP_DAYS = ARCHIVE_DAYS + 5   # days kept in Supabase. Past the window catch_up() rebuilds, or it
+                                     # would download a pruned day again on every run; the five days of
+                                     # room are the same REVIEW_HORIZON_SEC leaves
 SETTLE_DAYS = 2               # the nightly run recalculates this many recent days (late uploads)
 ARCHIVE_DELAY_SEC = 120       # the nightly run starts this long after 00:00 PKT
 STORE_RECHECK_SEC = 60        # scheduler tick; also how often to look for the archive tables
@@ -141,7 +144,8 @@ class ReportService:
         self._built = {}             # (first day, last day) -> (generation, violations, meta)
         self.archive = {"running": False, "day": None, "done": 0, "total": 0, "reason": None,
                         "last_run": None, "last_error": None}
-        self._reviews = None          # {review key: verdict}; reviews change only through this portal
+        self._reviews = {}            # {review key: verdict}; reviews change only through this portal
+        self._reviews_loaded = False  # whether the read of the stored verdicts has succeeded
         self._reviews_at = 0.0
         self.reviews_error = None
         self._reviews_lock = threading.Lock()
@@ -459,29 +463,33 @@ class ReportService:
         if self.store is None:
             return {}
         due = self._reviews_at == 0 or (retry and time.time() - self._reviews_at >= REVIEWS_RETRY_SEC)
-        if self._reviews is None and due:
+        if not self._reviews_loaded and due:
             with self._reviews_lock:
-                if self._reviews is None:
+                if not self._reviews_loaded:
                     self._reviews_at = time.time()
                     try:
-                        self._reviews = self.store.load_reviews(time.time() - REVIEW_HORIZON_SEC)
+                        stored = self.store.load_reviews(time.time() - REVIEW_HORIZON_SEC)
+                        # a verdict set through this portal while the read was owed is already in the
+                        # table, but keep it anyway in case the read crossed the write
+                        stored.update(self._reviews)
+                        self._reviews = stored
+                        self._reviews_loaded = True
                         self.reviews_error = None
                         self.reviews_version += 1
                     except Exception:
                         self.reviews_error = self.store.reviews_problem() or "reviews could not be read"
-        return self._reviews or {}
+        return self._reviews
 
     def set_review(self, key, verdict):
         """Save a verdict (None clears it) and keep the in-memory copy in step."""
         self.store.set_review(key, verdict)
         with self._reviews_lock:
-            if self._reviews is None:
-                self._reviews = {}
             if verdict:
                 self._reviews[key] = verdict
             else:
                 self._reviews.pop(key, None)
-            self.reviews_error = None
+            # reviews_error is left alone on purpose: writing one verdict says nothing about whether
+            # the stored ones could be read, and clearing it here would hide that they are missing
             self.reviews_version += 1
 
     def vehicle_regions(self):
@@ -509,7 +517,7 @@ class ReportService:
         the server and could repeat a version a browser already holds)."""
         with self._reviews_lock:
             if getattr(self, "_fp_at", None) != self.reviews_version:
-                self._fp = _fingerprint(sorted(self._reviews.items()) if self._reviews else [])
+                self._fp = _fingerprint(sorted(self._reviews.items()))
                 self._fp_at = self.reviews_version
             return self._fp
 
@@ -693,6 +701,21 @@ class ReportService:
             self.archive.update(running=False, day=None, done=self.archive["total"],
                                 last_run=fv.fmt_time(int(time.time())))
 
+    def prune_archive(self):
+        """Drop archived days that have fallen out of PRUNE_KEEP_DAYS, so the Supabase tables settle at
+        the size of the window instead of growing for ever. Never allowed to fail the nightly run: rows
+        left behind cost a little disk, while a raised exception would cost the days still to calculate."""
+        if not self.store_ready():
+            return
+        try:
+            deleted = self.store.prune(PRUNE_KEEP_DAYS)
+        except Exception as e:
+            print(f"[Archive] prune failed: {e}")
+            return
+        if any(deleted.values()):
+            print("[Archive] pruned days older than {}: {}".format(
+                PRUNE_KEEP_DAYS, ", ".join(f"{n} from {t}" for t, n in deleted.items() if n)))
+
     def limits_changed(self):
         """New fatigue limits: recalculate the archive in the background."""
         with self._lock:
@@ -766,7 +789,7 @@ class ReportService:
             filled = False
             while True:
                 try:
-                    if self._reviews is None:
+                    if not self._reviews_loaded:
                         self.reviews(retry=True)          # the reviews table may have been created since
                     if self.store_ready():
                         if not filled:
@@ -786,6 +809,7 @@ class ReportService:
                                     print(f"[Archive] nightly {name} failed: {e}")
                             self.archive.update(running=False, day=None)
                             self.catch_up("nightly")
+                            self.prune_archive()
                         elif self.archive.get("last_error") and time.time() - self._caught_up_at >= RETRY_FAILED_SEC:
                             self.catch_up("retrying failed days")
                     elif time.time() >= due:

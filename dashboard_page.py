@@ -3,7 +3,12 @@ The dashboard page (/dashboard): headline cards and four charts for one shortcut
 
 Served as a plain response rather than a template. All numbers come from /api/dashboard, which adds
 them up on the server (dashboard_data.py); the page only draws them.
+
+The look comes from theme.py, shared with the portal, so the two pages cannot drift apart.
 """
+
+import review_modal
+import theme
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -15,42 +20,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <style>
-    /* Palette: Space Cadet (#25344F), Slate Gray (#617891), Luminous Tan (#EBD2B2), Ice Blue (#9EC5E8), Caput Mortuum Lift (#E25763), Warm Amber (#E49767) */
-    :root {
-      --space-cadet: #25344F;
-      --slate-gray: #7C95B1;
-      --tan: #D5B893;
-      --tan-bright: #EBD2B2;
-      --coffee: #6F4D38;
-      --caput-mortuum: #632024;
-      
-      --ice-blue: #9EC5E8;
-      --ice-blue-light: #C5DDF5;
-      --alert-vibrant: #E25763;
-      --alert-soft: #FFCCD0;
-      --amber-vibrant: #E49767;
-      
-      --bg-deep: #0B1019;
-      --bg-gradient-top: #152030;
-      --panel: rgba(21, 32, 48, 0.85);
-      --panel-edge: rgba(158, 197, 232, 0.24);
-      --tan-edge: rgba(235, 210, 178, 0.45);
-      
-      --text: #FFFFFF;
-      --text-2: #C5DDF5;
-      --text-3: #7C95B1;
-    }
-    html { font-size: clamp(12px, min(1vw, 1.8vh), 18px); }
-    body {
-      font-family: 'Inter', sans-serif; margin: 0; color: var(--text); background-color: var(--bg-deep);
-      background:
-        radial-gradient(ellipse 65% 50% at 50% -10%, rgba(235, 210, 178, 0.18), transparent 70%),
-        radial-gradient(ellipse 70% 60% at 85% 10%, rgba(226, 87, 99, 0.12), transparent 70%),
-        linear-gradient(180deg, var(--bg-gradient-top) 0%, #111B29 45%, var(--bg-deep) 100%);
-      background-attachment: fixed;
-    }
-
+"""  + theme.FAVICON_CHART + theme.THEME_HEAD + r"""  <style>
     /* The violations page's grid: header row + main; main = one row of headline cards, and the charts
        taking the rest of the window, with the same gaps, padding and 120rem container */
     .app-shell { height: 100vh; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
@@ -58,20 +28,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 width: 100%; max-width: 120rem; margin: 0 auto; min-height: 0; box-sizing: border-box; }
     .charts { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; min-height: 0; }
 
-    .topbar { background: rgba(21, 32, 48, 0.92); border-bottom: 1px solid var(--panel-edge); backdrop-filter: blur(12px); }
-    .logo { background: linear-gradient(135deg, var(--space-cadet), var(--coffee) 50%, var(--tan-bright)); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5); border: 1px solid var(--tan-edge); }
-    .muted { color: var(--text-2); }
-    .presets { background: rgba(11, 16, 25, 0.85); border: 1px solid var(--panel-edge); }
-    .preset { color: var(--text-2); }
-    .preset:hover { color: #fff; }
-    .preset.on { color: #fff; background: linear-gradient(135deg, var(--coffee), var(--caput-mortuum)); box-shadow: 0 2px 10px rgba(226, 87, 99, 0.35); border: 1px solid rgba(235, 210, 178, 0.3); }
-    .btn-ghost { color: var(--text); background: rgba(37, 52, 79, 0.85); border: 1px solid var(--panel-edge); }
-    .btn-ghost:hover { background: rgba(124, 149, 177, 0.35); border-color: var(--ice-blue); }
-    .btn-ghost i { color: var(--tan-bright); }
-    .btn-main { color: #fff; background: linear-gradient(135deg, var(--coffee), var(--caput-mortuum)); border: 1px solid rgba(235, 210, 178, 0.3); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
-    .btn-main:hover { filter: brightness(1.15); box-shadow: 0 4px 20px rgba(226, 87, 99, 0.35); }
+    .topbar { background: var(--slate); box-shadow: 0 2px 10px rgba(43, 36, 36, 0.25); }
+    .logo { background: linear-gradient(135deg, var(--brand-deep), var(--brand) 55%, var(--accent)); border: 1px solid rgba(255, 255, 255, 0.15); }
+    .muted { color: var(--ice); }
+    .presets { background: var(--slate-deep); border: 1px solid var(--slate-deep); }
+    .preset { color: var(--ice); }
+    .preset:hover { color: #FFFFFF; background: rgba(255, 255, 255, 0.12); }
+    .preset.on { color: #FFFFFF; background: var(--brand); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); border: 1px solid var(--brand); }
+    .btn-ghost { color: var(--ink); background: var(--card); border: 1px solid var(--edge2); }
+    .btn-ghost:hover { background: var(--rail); border-color: var(--accent); }
+    .btn-ghost i { color: var(--accent); }
+    .btn-main { color: var(--ice-lt); background: var(--brand); border: 1px solid var(--brand); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }
+    .btn-main:hover { background: var(--brand-deep); }
 
-    .surface { background: var(--panel); border: 1px solid var(--panel-edge); backdrop-filter: blur(10px); box-shadow: inset 0 1px 0 rgba(235, 210, 178, 0.12), 0 10px 28px rgba(0, 0, 0, 0.5); }
+    .surface { background: var(--card); border: 1px solid var(--edge); box-shadow: 0 6px 18px rgba(64, 55, 55, 0.07); }
     /* Headline cards: one row of nine numbers and a wider period card; sizes are rem-based, so the
        numbers shrink with the cards on smaller windows */
     .kpis { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)) minmax(0, 1.8fr); gap: 0.75rem; }
@@ -81,23 +51,57 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .kpi-head .kpi-label { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
                            line-height: 1.25; min-height: 2.5em; }
     .kpi-head i { font-size: 0.85rem; flex-shrink: 0; margin-top: 0.1rem; }
-    .kpi-label { color: var(--text-2); }
-    .kpi-sub { color: var(--text-3); }
-    .panel { display: flex; flex-direction: column; min-height: 0; position: relative; padding: 0.9rem 1.25rem 0.75rem; }
-    .panel h2 { font-size: 1rem; font-weight: 700; color: var(--text); margin: 0 0 0.15rem; }
-    .panel .hint { font-size: 0.75rem; color: var(--text-2); margin-bottom: 0.5rem; }
-    .chart-box { position: relative; flex: 1; min-height: 0; }
-    .empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--text-3); font-size: 0.875rem; }
-    .loading .chart-box canvas { opacity: 0.25; transition: opacity 0.2s; }
-    .stale { color: var(--tan-bright) !important; }
-    #toast { background: rgba(21, 32, 48, 0.98); border: 1px solid var(--tan-edge); color: var(--text); box-shadow: 0 12px 35px rgba(0, 0, 0, 0.7); }
+    /* Solid tiles, like the portal's: near-white label over the fill, white number. Each tile's colour
+       says what it counts rather than following the page palette: rust for the headline total, steel
+       blue for the fleet, teal for places, green for Genuine, red for False,
+       grey for work still pending (as in the charts), red and amber for top and average speed, charcoal
+       for the period. */
+    .kpi.surface { --kpi: var(--brand); background: var(--kpi); border-color: var(--kpi);
+                   box-shadow: 0 4px 14px color-mix(in srgb, var(--kpi) 28%, transparent); }
+    .kpi .kpi-label, .kpi-head i { color: var(--ice); }
+    .kpi strong, .kpi .kpi-value { color: #FFFFFF; }
+    .kpi-sub { color: var(--ice); opacity: 0.85; }
+    .kpi-info.surface    { --kpi: var(--info); }
+    .kpi-place.surface   { --kpi: var(--teal); }
+    .kpi-genuine.surface { --kpi: var(--ok); }
+    .kpi-rate.surface    { --kpi: var(--ok-deep); }
+    .kpi-false.surface   { --kpi: var(--danger); }
+    .kpi-pending.surface { --kpi: var(--slate); }
+    .kpi-warn.surface    { --kpi: var(--warn); }
+    .kpi-alert.surface   { --kpi: var(--danger); }
+    .kpi-wide.surface    { --kpi: var(--slate-deep); }
 
-    /* Custom Drawer Scrollbar & Animations */
+    .panel { display: flex; flex-direction: column; min-height: 0; position: relative; padding: 0.9rem 1.25rem 0.75rem; }
+    .panel h2 { font-size: 1rem; font-weight: 700; color: var(--ink); margin: 0 0 0.15rem; }
+    .panel .hint { font-size: 0.75rem; color: var(--ink2); margin-bottom: 0.5rem; }
+    .chart-box { position: relative; flex: 1; min-height: 0; }
+    /* The drill-down that lists real violations rather than counts; it takes the canvas's slot */
+    .list-box { flex: 1; min-height: 0; overflow: auto; margin: 0 -0.35rem; }
+    .list-box.hidden, .chart-box.hidden { display: none; }
+    .vrow { display: grid; grid-template-columns: 11.5rem 7.5rem minmax(0, 1fr) 5.5rem; gap: 0.6rem;
+            align-items: center; padding: 0.42rem 0.6rem; border-radius: 0.5rem; cursor: pointer;
+            font-size: 0.78rem; }
+    .vrow + .vrow { border-top: 1px solid var(--edge); }
+    .vrow:hover { background: var(--hover); }
+    .vrow .t { font-family: ui-monospace, monospace; color: var(--ink); white-space: nowrap; }
+    .vrow .v { font-family: ui-monospace, monospace; font-weight: 700; color: var(--brand-deep); }
+    .vrow .d { color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .vchip { justify-self: end; padding: 0.08rem 0.5rem; border-radius: 999px; font-size: 0.68rem;
+             font-weight: 700; border: 1px solid; white-space: nowrap; }
+    .vchip.genuine { background: var(--ok-soft);     color: var(--ok-deep);     border-color: var(--ok); }
+    .vchip.false   { background: var(--danger-soft); color: var(--danger);      border-color: var(--danger); }
+    .vchip.pending { background: var(--rail);        color: var(--ink2);        border-color: var(--edge2); }
+    .list-note { padding: 0.5rem 0.6rem; font-size: 0.72rem; color: var(--ink3); }
+""" + review_modal.STYLES + r"""
+    .empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--ink3); font-size: 0.875rem; }
+    .loading .chart-box canvas { opacity: 0.25; transition: opacity 0.2s; }
+    .stale { color: var(--accent-deep) !important; }
+    #toast { background: var(--card); border: 1px solid var(--accent); color: var(--ink); box-shadow: 0 12px 30px rgba(64, 55, 55, 0.22); }
+
     .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
-    .custom-scrollbar::-webkit-scrollbar-track { background: rgba(11, 16, 25, 0.6); }
-    .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(124, 149, 177, 0.4); border-radius: 3px; }
-    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: var(--tan-bright); }
-    
+    .custom-scrollbar::-webkit-scrollbar-track { background: var(--rail); }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: var(--edge2); border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: var(--ink3); }
 
     /* Narrow or very short windows: fall back to normal page scrolling, as the violations page does */
     @media (max-width: 1023px), (max-height: 540px) {
@@ -121,6 +125,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </style>
 </head>
 <body>
+""" + review_modal.MARKUP + r"""
 <div class="app-shell">
   <header class="topbar z-40">
     <div class="max-w-[120rem] mx-auto px-7 h-16 flex items-center justify-between gap-4">
@@ -130,7 +135,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="min-w-0">
           <h1 class="font-bold text-xl leading-tight tracking-tight truncate text-white">Violations Dashboard</h1>
-          <p class="text-xs muted font-mono truncate text-[#9EC5E8]">Unilever fleet · all times PKT (UTC+5)</p>
+          <p class="text-xs muted font-mono truncate">Unilever fleet · all times PKT (UTC+5)</p>
         </div>
       </div>
       <div class="actions flex items-center gap-3 shrink-0">
@@ -155,45 +160,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <!-- HEADLINE CARDS: one row -->
     <div class="kpis">
       <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Total Events</span><i class="fa-solid fa-list-check" style="color: var(--tan-bright)"></i></div>
-        <strong id="kpi-total" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate" style="color: var(--tan-bright)">-</strong>
+        <div class="kpi-head"><span class="kpi-label">Total Events</span><i class="fa-solid fa-list-check"></i></div>
+        <strong id="kpi-total" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Vehicles Involved</span><i class="fa-solid fa-truck" style="color: var(--ice-blue)"></i></div>
-        <strong id="kpi-vehicles" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate text-white">-</strong>
+      <div class="kpi kpi-info surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Vehicles Involved</span><i class="fa-solid fa-truck"></i></div>
+        <strong id="kpi-vehicles" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Regions</span><i class="fa-solid fa-map-location-dot" style="color: var(--ice-blue)"></i></div>
-        <strong id="kpi-regions" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate text-white">-</strong>
+      <div class="kpi kpi-place surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Regions</span><i class="fa-solid fa-map-location-dot"></i></div>
+        <strong id="kpi-regions" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Genuine</span><i class="fa-solid fa-circle-check" style="color: var(--tan-bright)"></i></div>
-        <strong id="kpi-genuine" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate" style="color: var(--tan-bright)">-</strong>
+      <div class="kpi kpi-genuine surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Genuine</span><i class="fa-solid fa-circle-check"></i></div>
+        <strong id="kpi-genuine" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">False</span><i class="fa-solid fa-circle-xmark" style="color: var(--alert-vibrant)"></i></div>
-        <strong id="kpi-false" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate" style="color: var(--alert-vibrant)">-</strong>
+      <div class="kpi kpi-false surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">False</span><i class="fa-solid fa-circle-xmark"></i></div>
+        <strong id="kpi-false" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Pending Review</span><i class="fa-solid fa-hourglass-half" style="color: var(--ice-blue)"></i></div>
-        <strong id="kpi-pending" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate" style="color: var(--ice-blue)">-</strong>
+      <div class="kpi kpi-pending surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Pending Review</span><i class="fa-solid fa-hourglass-half"></i></div>
+        <strong id="kpi-pending" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Genuine %</span><i class="fa-solid fa-percent" style="color: var(--tan-bright)"></i></div>
-        <strong id="kpi-pct" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate" style="color: var(--tan-bright)">-</strong>
+      <div class="kpi kpi-rate surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Genuine %</span><i class="fa-solid fa-percent"></i></div>
+        <strong id="kpi-pct" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Max Speed (km/h)</span><i class="fa-solid fa-gauge-high" style="color: var(--alert-vibrant)"></i></div>
-        <strong id="kpi-max" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate" style="color: var(--alert-vibrant)">-</strong>
+      <div class="kpi kpi-alert surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Max Speed (km/h)</span><i class="fa-solid fa-gauge-high"></i></div>
+        <strong id="kpi-max" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
-      <div class="kpi surface rounded-2xl">
-        <div class="kpi-head"><span class="kpi-label">Avg O/S Speed</span><i class="fa-solid fa-gauge" style="color: var(--amber-vibrant)"></i></div>
-        <strong id="kpi-avg" class="text-3xl font-extrabold font-mono leading-none mt-2 block truncate text-white">-</strong>
+      <div class="kpi kpi-warn surface rounded-2xl">
+        <div class="kpi-head"><span class="kpi-label">Avg O/S Speed</span><i class="fa-solid fa-gauge"></i></div>
+        <strong id="kpi-avg" class="kpi-value text-3xl font-extrabold font-mono leading-none mt-2 block truncate">-</strong>
       </div>
       <div class="kpi kpi-wide surface rounded-2xl">
-        <div class="kpi-head"><span id="period-title" class="kpi-label">Report Period</span><i class="fa-solid fa-calendar-days" style="color: var(--tan-bright)"></i></div>
-        <strong id="period" class="text-base font-extrabold font-mono leading-tight mt-2 block truncate" style="color: var(--tan-bright)">Loading...</strong>
-        <span id="source" class="kpi-sub text-xs font-mono block truncate mt-1 text-[#9EC5E8]">&nbsp;</span>
+        <div class="kpi-head"><span id="period-title" class="kpi-label">Report Period</span><i class="fa-solid fa-calendar-days"></i></div>
+        <strong id="period" class="kpi-value text-base font-extrabold font-mono leading-tight mt-2 block truncate">Loading...</strong>
+        <span id="source" class="kpi-sub text-xs font-mono block truncate mt-1">&nbsp;</span>
       </div>
     </div>
 
@@ -203,12 +208,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="flex items-center justify-between mb-0.5 gap-3">
           <div class="flex items-center gap-2.5 min-w-0">
             <button id="region-back" onclick="showAllRegions()" title="Back to all regions (Esc)"
-                    class="hidden shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#1E2D42] hover:bg-[#2B3E59] text-[#C5DDF5] hover:text-white text-[11px] font-bold transition">
+                    class="hidden shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-brand-soft hover:bg-head text-ink2 hover:text-ink text-[11px] font-bold transition">
               <i class="fa-solid fa-chevron-left text-[10px]"></i> All regions
             </button>
             <h2 id="region-title" class="m-0 truncate">Total Violations by Region</h2>
           </div>
-          <span class="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-[rgba(235,210,178,0.12)] text-[#EBD2B2] border border-[rgba(235,210,178,0.3)] shadow-sm shrink-0">
+          <span class="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-accent-soft text-accent-deep border border-accent/30 shadow-sm shrink-0">
             <i class="fa-solid fa-hand-pointer text-[10px]"></i> <span id="region-pill">Click bar to view vehicles</span>
           </span>
         </div>
@@ -216,9 +221,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="chart-box"><canvas id="c-region"></canvas><div class="empty">No violations in this period</div></div>
       </div>
       <div class="panel surface rounded-2xl">
-        <h2>Event Type — Genuine vs False</h2>
-        <div class="hint">Marked in the Inspect view of each vehicle; the rest are pending review</div>
-        <div class="chart-box"><canvas id="c-type"></canvas><div class="empty">No violations in this period</div></div>
+        <div class="flex items-center justify-between mb-0.5 gap-3">
+          <div class="flex items-center gap-2.5 min-w-0">
+            <button id="type-back" onclick="showAllTypes()" title="Back to all types (Esc)"
+                    class="hidden shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-brand-soft hover:bg-head text-ink2 hover:text-ink text-[11px] font-bold transition">
+              <i class="fa-solid fa-chevron-left text-[10px]"></i> All types
+            </button>
+            <h2 id="type-title" class="m-0 truncate">Event Type — Genuine vs False</h2>
+          </div>
+          <span class="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-accent-soft text-accent-deep border border-accent/30 shadow-sm shrink-0">
+            <i class="fa-solid fa-hand-pointer text-[10px]"></i> <span id="type-pill">Click bar to list its violations</span>
+          </span>
+        </div>
+        <div class="hint" id="type-hint">Marked in the Inspect view of each vehicle; the rest are pending review</div>
+        <div class="chart-box" id="type-chart-box"><canvas id="c-type"></canvas><div class="empty">No violations in this period</div></div>
+        <div class="list-box hidden" id="type-list-box"></div>
       </div>
       <div class="panel surface rounded-2xl">
         <h2>Region-wise Violation Mix by Event Type</h2>
@@ -240,35 +257,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
   const PRESETS = ['1D', '7D', '15D', '30D'];
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  // Palette: Space Cadet (#25344F), Slate Gray (#7C95B1), Luminous Tan (#EBD2B2), Ice Blue (#9EC5E8), Alert (#E25763), Amber (#E49767)
+  // Chart palette, built from the same tokens as the stylesheet (theme.py) so the charts cannot
+  // drift from the page around them. Types and verdicts use the same hues as the portal's badges.
+  const CSS = getComputedStyle(document.documentElement);
+  const tok = name => CSS.getPropertyValue('--' + name).trim();
   const PAL = {
-    spaceCadet: '#25344F',
-    spaceCadetLight: '#3D547B',
-    slateGray: '#7C95B1',
-    slateGrayLight: '#9EC5E8',
-    tan: '#D5B893',
-    tanBright: '#EBD2B2',
-    coffee: '#6F4D38',
-    coffeeLight: '#94674B',
-    caputMortuum: '#632024',
-    alertVibrant: '#E25763',
-    amberVibrant: '#E49767',
-    iceBlue: '#9EC5E8',
-    text: '#FFFFFF',
-    text2: '#C5DDF5',
-    text3: '#7C95B1'
+    brand: tok('brand'),
+    brandDeep: tok('brand-deep'),
+    accent: tok('accent'),
+    slate: tok('slate'),
+    text: tok('ink'),
+    text2: tok('ink2'),
+    text3: tok('ink3'),
+    grid: tok('edge'),
+    card: tok('card')
   };
   const TYPE_COLORS = {
-    OVERSPEED: PAL.alertVibrant,
-    DELAY_DRIVER_SEAT_BELT: PAL.iceBlue,
-    SEAT_BELT_DISCONNECTED: PAL.tan,
-    SEAT_BELT_IGNITION_OFF: PAL.slateGray,
-    OVERSPEED_HIGHWAY: PAL.amberVibrant,
-    OVERSPEED_MOTORWAY: '#F47C88',
-    NIGHT_DRIVING: PAL.spaceCadetLight,
-    FATIGUE_DRIVING: PAL.tanBright
+    OVERSPEED: tok('danger'),
+    OVERSPEED_HIGHWAY: tok('warn'),
+    OVERSPEED_MOTORWAY: tok('danger-deep'),
+    FATIGUE_DRIVING: tok('plum'),
+    NIGHT_DRIVING: tok('info'),
+    SEAT_BELT_DISCONNECTED: tok('teal'),
+    DELAY_DRIVER_SEAT_BELT: tok('coffee'),
+    SEAT_BELT_IGNITION_OFF: tok('slate')
   };
-  const VERDICT_COLORS = { genuine: PAL.tanBright, false: PAL.alertVibrant, pending: 'rgba(158, 197, 232, 0.35)' };
+  const VERDICT_COLORS = { genuine: tok('ok'), false: tok('danger'), pending: tok('edge2') };
   let preset = '7D';
   let charts = {};
   // Each period is fetched once and kept here; the browser also keeps it across pages, and the server
@@ -323,7 +337,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             ctx.textAlign = 'left';
             ctx.fillText(num(v), el.x + 6, el.y);
           } else if (Math.abs(el.x - el.base) >= 24) {   // inside a stacked segment, when it fits
-            ctx.fillStyle = ds.labelColor || '#141d2c';
+            ctx.fillStyle = ds.labelColor || PAL.text;
             ctx.textAlign = 'center';
             ctx.fillText(num(v), (el.x + el.base) / 2, el.y);
           }
@@ -350,7 +364,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         if (radius >= size * 0.85) {                      // the count only when it fits inside
           ctx.font = '700 ' + Math.round(size * 0.85) + 'px Inter, sans-serif';
           ctx.textBaseline = 'middle';
-          ctx.fillStyle = '#0B1019';
+          ctx.fillStyle = PAL.card;
           ctx.fillText(num(point.veh.total), el.x, el.y);
         }
         // Bubbles come biggest first, so the busiest vehicles win the space; a plate that would
@@ -374,15 +388,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   function chartDefaults() {
     const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 14;
     Chart.defaults.color = PAL.text2;
-    Chart.defaults.borderColor = 'rgba(158, 197, 232, 0.14)';
+    Chart.defaults.borderColor = PAL.grid;
     Chart.defaults.font.family = 'Inter, sans-serif';
     Chart.defaults.font.size = Math.round(rem * 0.78);
     Chart.defaults.maintainAspectRatio = false;
     Chart.defaults.plugins.legend.labels.boxWidth = 10;
     Chart.defaults.plugins.legend.labels.boxHeight = 10;
     Object.assign(Chart.defaults.plugins.tooltip, {
-      backgroundColor: 'rgba(21, 32, 48, 0.98)', borderColor: 'rgba(235, 210, 178, 0.5)', borderWidth: 1,
-      titleColor: PAL.tanBright, bodyColor: PAL.text, padding: 10
+      backgroundColor: tok('slate'), borderColor: tok('slate-deep'), borderWidth: 1,
+      titleColor: tok('ice-lt'), bodyColor: tok('ice'), padding: 10
     });
   }
 
@@ -396,22 +410,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   // Horizontal gradient across the chart area (recomputed as the chart resizes)
   function sweep(ctx) {
     const area = ctx.chart.chartArea;
-    if (!area) return PAL.tanBright;
+    if (!area) return PAL.brand;
     const g = ctx.chart.ctx.createLinearGradient(area.left, 0, area.right, 0);
-    g.addColorStop(0, PAL.spaceCadet);
-    g.addColorStop(0.5, PAL.coffee);
-    g.addColorStop(1, PAL.tanBright);
+    g.addColorStop(0, PAL.slate);
+    g.addColorStop(0.5, PAL.brandDeep);
+    g.addColorStop(1, PAL.accent);
     return g;
   }
 
-  // Warm Tan glow under the hourly line
+  // Rust glow under the hourly line
   function glow(ctx) {
     const area = ctx.chart.chartArea;
-    if (!area) return 'rgba(235, 210, 178, 0.15)';
+    if (!area) return 'rgba(143, 59, 59, 0.12)';
     const g = ctx.chart.ctx.createLinearGradient(0, area.top, 0, area.bottom);
-    g.addColorStop(0, 'rgba(235, 210, 178, 0.35)');
-    g.addColorStop(0.55, 'rgba(111, 77, 56, 0.18)');
-    g.addColorStop(1, 'rgba(11, 16, 25, 0)');
+    g.addColorStop(0, 'rgba(143, 59, 59, 0.30)');
+    g.addColorStop(0.55, 'rgba(253, 220, 220, 0.35)');
+    g.addColorStop(1, 'rgba(250, 252, 252, 0)');
     return g;
   }
 
@@ -420,33 +434,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     drawRegions(d.by_region, empty);
 
-    const types = d.by_type.filter(t => t.total > 0);
-    draw('c-type', {
-      type: 'bar',
-      data: {
-        labels: types.map(t => t.label),
-        datasets: [
-          { label: 'Genuine', data: types.map(t => t.genuine), backgroundColor: VERDICT_COLORS.genuine, borderRadius: 3 },
-          { label: 'False', data: types.map(t => t.false), backgroundColor: VERDICT_COLORS.false, borderRadius: 3 },
-          { label: 'Pending', data: types.map(t => t.pending), backgroundColor: VERDICT_COLORS.pending, borderRadius: 3, labelColor: PAL.text }
-        ]
-      },
-      options: {
-        indexAxis: 'y',
-        plugins: { legend: { position: 'bottom' }, valueLabels: { mode: 'inside' } },
-        scales: {
-          x: { stacked: true, ticks: { precision: 0 } },
-          y: { stacked: true, grid: { display: false }, ticks: { autoSkip: false, font: { size: 11 } } }
-        }
-      },
-      plugins: [valueLabels]
-    }, empty);
+    drawTypes(d.by_type.filter(t => t.total > 0), empty);
 
-    const series = d.region_mix.series.filter(s => s.values.some(v => v > 0));
+    const mixKeep = d.region_mix.regions.map((r, i) => r === UNASSIGNED_REGION ? -1 : i).filter(i => i >= 0);
+    const series = d.region_mix.series
+      .map(s => ({ key: s.key, label: s.label, values: mixKeep.map(i => s.values[i]) }))
+      .filter(s => s.values.some(v => v > 0));
     draw('c-mix', {
       type: 'bar',
       data: {
-        labels: d.region_mix.regions,
+        labels: mixKeep.map(i => d.region_mix.regions[i]),
         datasets: series.map(s => ({ label: s.label, data: s.values, backgroundColor: TYPE_COLORS[s.key] || PAL.text3, borderRadius: 2 }))
       },
       options: {
@@ -459,8 +456,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       type: 'line',
       data: {
         labels: d.by_hour.map((_, h) => `${String(h).padStart(2, '0')}:00`),
-        datasets: [{ label: 'Violations', data: d.by_hour, borderColor: PAL.tanBright, backgroundColor: glow,
-                     fill: true, tension: 0.35, pointRadius: 3, pointBackgroundColor: PAL.tanBright, pointBorderColor: PAL.tanBright,
+        datasets: [{ label: 'Violations', data: d.by_hour, borderColor: PAL.brand, backgroundColor: glow,
+                     fill: true, tension: 0.35, pointRadius: 3, pointBackgroundColor: PAL.brand, pointBorderColor: PAL.brand,
                      pointHoverRadius: 5, borderWidth: 2 }]
       },
       options: {
@@ -485,7 +482,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     SEAT_BELT_IGNITION_OFF: 'SB On - Ign Off'
   };
   const REGION_HINT = "Grouped by the vehicle's depot region in Wialon: where it works, not where the violation happened";
-  let regionRows = [];           // kept so the back button can redraw without refetching
+  // UNASSIGNED_REGION comes from review_modal.py: it is not a region, just the fallback for a vehicle
+  // whose region is blank in Wialon. The charts show real regions only, and the hint says what that
+  // leaves out, so nothing goes missing quietly; the payload still carries it, so totals stay complete.
+  const named = rows => (rows || []).filter(r => r.region !== UNASSIGNED_REGION);
+
+  let regionAll = [];            // every row the server sent, Unassigned included
+  let regionRows = [];           // the named ones the bars are drawn from
   let regionEmpty = false;
   let activeRegion = null;
 
@@ -497,16 +500,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   function drawRegions(rows, empty) {
-    regionRows = rows || [];
+    regionAll = rows || [];
+    regionRows = named(regionAll);
     regionEmpty = !!empty;
     activeRegion = null;
-    regionHeader('Total Violations by Region', REGION_HINT, 'Click bar to view vehicles', false);
+    const hidden = regionAll.filter(r => r.region === UNASSIGNED_REGION);
+    const hiddenTotal = hidden.reduce((n, r) => n + r.total, 0);
+    const hiddenVehicles = hidden.reduce((n, r) => n + (r.vehicle_count || 0), 0);
+    regionHeader('Total Violations by Region',
+      REGION_HINT + (hiddenTotal
+        ? ` · ${num(hiddenTotal)} from ${num(hiddenVehicles)} vehicle(s) with no region set in Wialon are not shown`
+        : ''),
+      'Click bar to view vehicles', false);
     draw('c-region', {
       type: 'bar',
       data: {
         labels: regionRows.map(r => r.region),
         datasets: [{ label: 'Violations', data: regionRows.map(r => r.total), backgroundColor: sweep,
-                     hoverBackgroundColor: PAL.tanBright, borderRadius: 4, barPercentage: 0.75 }]
+                     hoverBackgroundColor: PAL.brand, borderRadius: 4, barPercentage: 0.75 }]
       },
       options: {
         indexAxis: 'y',
@@ -544,7 +555,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     const colorOf = v => {
       let best = null, most = -1;
       Object.keys(v.by_type || {}).forEach(k => { if (v.by_type[k] > most) { most = v.by_type[k]; best = k; } });
-      return TYPE_COLORS[best] || PAL.tanBright;
+      return TYPE_COLORS[best] || PAL.brand;
     };
     const points = all.map((v, k) => ({
       x: (k % cols) + 0.5,
@@ -567,7 +578,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           backgroundColor: colors.map(c => c + 'AA'),
           borderColor: colors,
           borderWidth: 1.5,
-          hoverBackgroundColor: PAL.tanBright,
+          hoverBackgroundColor: PAL.brand,
           hoverBorderColor: PAL.text
         }]
       },
@@ -576,7 +587,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         onClick: (evt, els) => {
           if (!els || !els.length) return;
           const v = points[els[0].index].veh;
-          if (v) window.location.href = `/?preset=${preset}&search=${encodeURIComponent(v.vehicle)}`;
+          if (v) openReview(v.vehicle, v.vehicle_id);
         },
         onHover: (evt, els) => { evt.native.target.style.cursor = (els && els.length) ? 'pointer' : 'default'; },
         plugins: {
@@ -592,7 +603,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               Object.keys(v.by_type || {}).forEach(k => {
                 if (v.by_type[k]) lines.push(`   ${TYPE_SHORT[k] || k}: ${v.by_type[k]}`);
               });
-              lines.push('(Click to open this vehicle in the portal)');
+              lines.push('(Click to review this vehicle in the portal)');
               return lines;
             }
           } }
@@ -608,7 +619,158 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   function showAllRegions() {
     if (!activeRegion) return;
-    drawRegions(regionRows, regionEmpty);
+    drawRegions(regionAll, regionEmpty);
+  }
+
+  // ------------------------------------------------------------------ event type, and its violations
+  const TYPE_HINT = 'Marked in the Inspect view of each vehicle; the rest are pending review';
+  let typeRows = [];             // kept so the back button can redraw without refetching
+  let typeEmpty = false;
+  let activeType = null;
+  const typeViolations = {};     // `${preset}|${TYPE}` -> the rows the endpoint returned
+
+  function typeHeader(title, hint, pill, showBack) {
+    document.getElementById('type-title').textContent = title;
+    document.getElementById('type-hint').textContent = hint;
+    document.getElementById('type-pill').textContent = pill;
+    document.getElementById('type-back').classList.toggle('hidden', !showBack);
+  }
+
+  function typePanel(showList) {
+    document.getElementById('type-chart-box').classList.toggle('hidden', showList);
+    document.getElementById('type-list-box').classList.toggle('hidden', !showList);
+  }
+
+  function drawTypes(rows, empty) {
+    typeRows = rows || [];
+    typeEmpty = !!empty;
+    activeType = null;
+    typeHeader('Event Type — Genuine vs False', TYPE_HINT, 'Click bar to list its violations', false);
+    typePanel(false);
+    draw('c-type', {
+      type: 'bar',
+      data: {
+        labels: typeRows.map(t => t.label),
+        datasets: [
+          { label: 'Genuine', data: typeRows.map(t => t.genuine), backgroundColor: VERDICT_COLORS.genuine, borderRadius: 3 },
+          { label: 'False', data: typeRows.map(t => t.false), backgroundColor: VERDICT_COLORS.false, borderRadius: 3 },
+          { label: 'Pending', data: typeRows.map(t => t.pending), backgroundColor: VERDICT_COLORS.pending, borderRadius: 3, labelColor: PAL.text }
+        ]
+      },
+      options: {
+        indexAxis: 'y',
+        // the whole row drills in, whichever segment was clicked: the thin ones are hard to hit
+        onClick: (evt, els) => { if (els && els.length) drillType(typeRows[els[0].index]); },
+        onHover: (evt, els) => { evt.native.target.style.cursor = (els && els.length) ? 'pointer' : 'default'; },
+        plugins: {
+          legend: { position: 'bottom' }, valueLabels: { mode: 'inside' },
+          tooltip: { callbacks: { afterLabel: ctx => {
+            const t = typeRows[ctx.dataIndex];
+            return `${num(t.total)} in total (Click for this type's violations)`;
+          } } }
+        },
+        scales: {
+          x: { stacked: true, ticks: { precision: 0 } },
+          y: { stacked: true, grid: { display: false }, ticks: { autoSkip: false, font: { size: 11 } } }
+        }
+      },
+      plugins: [valueLabels]
+    }, typeEmpty);
+  }
+
+  async function drillType(row) {
+    if (!row) return;
+    activeType = row;
+    typePanel(true);
+    typeHeader(`${row.label} — violations`, `Loading ${num(row.total)} violation(s)...`, 'Click a row to inspect in the portal', true);
+    const box = document.getElementById('type-list-box');
+    box.innerHTML = '<div class="list-note">Loading...</div>';
+
+    const key = `${preset}|${row.key}`;
+    try {
+      if (!typeViolations[key]) {
+        const res = await fetch(`/api/dashboard/type-violations?preset=${preset}&type=${encodeURIComponent(row.key)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not load these violations');
+        typeViolations[key] = data;
+      }
+    } catch (e) {
+      box.innerHTML = `<div class="list-note" style="color: var(--danger)">${esc(e.message)}</div>`;
+      typeHeader(`${row.label} — violations`, TYPE_HINT, 'Click a row to inspect in the portal', true);
+      return;
+    }
+    if (activeType !== row) return;      // a different bar was opened while this one was loading
+    renderTypeList(typeViolations[key], row);
+  }
+
+  function renderTypeList(data, row) {
+    const rows = data.violations || [];
+    const box = document.getElementById('type-list-box');
+    typeHeader(
+      `${row.label} — violations`,
+      `${num(data.total)} in ${data.period.label} · Genuine ${num(row.genuine)} · False ${num(row.false)} · Pending ${num(row.pending)}`,
+      'Click a row to inspect in the portal', true);
+
+    if (!rows.length) {
+      box.innerHTML = '<div class="list-note">No violations of this type in this period</div>';
+      return;
+    }
+    const chip = v => v === 'GENUINE' ? '<span class="vchip genuine">Genuine</span>'
+                   : v === 'FALSE'   ? '<span class="vchip false">False</span>'
+                   : '<span class="vchip pending">Pending</span>';
+    box.innerHTML =
+      (data.truncated ? `<div class="list-note">Showing the newest ${num(data.shown)} of ${num(data.total)} — open the portal for the full list</div>` : '')
+      + rows.map(v => `
+        <div class="vrow" data-plate="${esc(v.vehicle || '')}" data-key="${esc(v.vehicle_id + '|' + row.key + '|' + v.time_unix)}"
+             data-vid="${v.vehicle_id}" onclick="openReview(this.dataset.plate, this.dataset.vid, this.dataset.key)" title="${esc(v.location || '')}">
+          <span class="t">${esc(v.time || '')}</span>
+          <span class="v">${esc(v.vehicle || '')}</span>
+          <span class="d">${esc(v.driver || 'Unassigned')}${v.location ? ' · ' + esc(v.location) : ''}</span>
+          ${chip(v.verdict)}
+        </div>`).join('');
+    box.scrollTop = 0;
+  }
+
+""" + review_modal.SCRIPT + r"""
+  // Clicking anything on this page opens the review workbench over the dashboard. The violations
+  // come from the server, since this page only holds counts; the numbers behind it are refetched
+  // once the workbench closes, so they agree with whatever was just decided.
+  let reviewDirty = false;
+
+  function typeLabelOf(key) {
+    const d = dashCache[preset];
+    const row = d && d.by_type && d.by_type.find(t => t.key === key);
+    return (row && row.label) || TYPE_SHORT[key] || key;
+  }
+
+  Review.host = {
+    esc,
+    typeLabel: key => typeLabelOf(key),
+    typeBadge: key => {
+      const colour = TYPE_COLORS[key] || PAL.text3;
+      return `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[0.6875rem] font-bold"
+        style="background:${colour}22; color:${colour}; border:1px solid ${colour}66">${esc(typeLabelOf(key))}</span>`;
+    },
+    toast: (title, message) => toast(`${title}: ${message}`),
+    violations: async ctx => {
+      const res = await fetch(`/api/dashboard/vehicle-violations?preset=${preset}&vehicleId=${encodeURIComponent(ctx.vehicleId)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not load this vehicle');
+      return data.violations || [];
+    },
+    period: () => (dashCache[preset] && dashCache[preset].period) || {},
+    onVerdict: () => { reviewDirty = true; },
+    onClose: () => { if (reviewDirty) { reviewDirty = false; load(preset); } },
+  };
+
+  function openReview(plate, vehicleId, focusKey) {
+    if (!vehicleId) return;
+    Review.show({ plate, vehicleId, focusKey });
+  }
+
+  function showAllTypes() {
+    if (!activeType) return;
+    drawTypes(typeRows, typeEmpty);
   }
 
   // ------------------------------------------------------------------ loading
@@ -688,6 +850,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   window.addEventListener('DOMContentLoaded', () => {
     chartDefaults();
+    Review.bind();
     const asked = (new URLSearchParams(window.location.search).get('preset') || '').toUpperCase();
     load(PRESETS.includes(asked) ? asked : '7D');
   });
@@ -695,6 +858,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   window.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
       showAllRegions();
+      showAllTypes();
     }
   });
 </script>

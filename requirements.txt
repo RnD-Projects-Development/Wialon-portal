@@ -1,0 +1,14 @@
+# Web framework (app.py, audit_portal.py, dashboard_page.py)
+Flask>=3.1,<4.0
+
+# Excel report generation (reports.py, dashboard_export.py)
+openpyxl>=3.1,<4.0
+
+# Optional: Supabase backend. supabase_client.py falls back to local
+# SQLite (compliance.db) when this is not installed.
+supabase>=2.29,<3.0
+
+# Production WSGI server. One process with a thread pool, which is what the
+# archive job and the in-memory payload cache need: see the note at the foot
+# of app.py. Not used by the `python app.py` development server.
+waitress>=3.0,<4.0
