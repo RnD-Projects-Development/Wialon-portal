@@ -1841,8 +1841,8 @@ PORTAL_HTML = """
                     <th class="w-[24%] px-2 py-3.5 text-center">Telemetry (Speed / Ign)</th>
                     <th class="w-[14%] px-2 py-3.5 text-center" data-tip="The timer that decides Fatigue Driving. On a driving row it is how long the vehicle has driven without a 00:05 reset stop - this is what trips the 02:30 day / 02:00 night limit. On a stopped row it is how long the current stop has lasted, which is what has to reach 00:05 to clear the drive timer.">Drive / Stop Timer</th>
                     <th class="w-[14%] px-2 py-3.5 text-center">State</th>
-                    <th class="w-[20%] px-3 py-3.5 text-center">Location</th>
-                    <th class="w-[10%] px-2 py-3.5 text-center">Status</th>
+                    <th class="w-[16%] px-3 py-3.5 text-center">Location</th>
+                    <th class="w-[14%] px-2 py-3.5 text-center">Status</th>
                   </tr>
                 </thead>
                 <tbody id="timeline-table-body" class="divide-y divide-edge font-mono"></tbody>
@@ -2713,6 +2713,11 @@ PORTAL_HTML = """
       tBody.innerHTML = rows.map(row => {
         const mark = row === markRow;
         const isVio = (mark && v) || (row.status && (row.status.includes('BREACH') || row.status.includes('VIOLATION') || row.status.includes('EXCEEDED')));
+        // Name the violation rather than a bare VIOLATION: the alert's own type on the trigger row, else
+        // the label the server tagged the row with ("VIOLATION (Overspeed)") or the fatigue engine's breach
+        const vioName = !isVio ? '' : (mark && v) ? typeLabel(v.type)
+          : ((row.status.match(/VIOLATION [(](.+)[)]/) || [])[1]
+             || (row.status.includes('BREACH') || row.status.includes('EXCEEDED') ? typeLabel('FATIGUE_DRIVING') : 'Violation'));
         const spd = row.speed || 0;
         const ign = row.ignition || 'OFF';
         const outside = w && !mark && (runFrom !== null
@@ -2735,7 +2740,8 @@ PORTAL_HTML = """
             <td class="px-2 py-1.5 text-center text-xs font-semibold text-ink2">${esc(row.state)}</td>
             <td class="px-3 py-1.5 text-ink font-medium text-xs truncate text-center" data-tip="${esc(row.location)}">${esc(row.location)}</td>
             <td class="px-2 py-1.5 text-center text-xs">
-              <span class="px-2 py-0.5 rounded text-[0.625rem] font-bold ${isVio ? 'bg-danger text-ice border border-danger' : 'bg-rail text-ink2 border border-edge'}">${isVio ? 'VIOLATION' : 'Normal'}</span>
+              <span class="inline-block max-w-full px-2 py-0.5 rounded text-[0.625rem] font-bold leading-tight ${isVio ? 'bg-danger text-ice border border-danger' : 'bg-rail text-ink2 border border-edge'}"
+                ${isVio ? `data-tip="${esc(vioName)}"` : ''}>${isVio ? esc(vioName) : 'Normal'}</span>
             </td>
           </tr>`;
       }).join('');
